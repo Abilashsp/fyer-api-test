@@ -1,122 +1,155 @@
-// src/dataSocket.js
+// dataSocket.js
+const { fyersDataSocket } = require("fyers-api-v3");
+const { EventEmitter } = require("events");
+const WebSocket = require('ws');
+const entryTimeService = require('./services/entryTimeService');
 
-const { fyersDataSocket } = require('fyers-api-v3');
-const { EventEmitter } = require('events');
+// Nifty 50 symbols
+const nifty50Symbols = [
+  "NSE:ADANIENT-EQ", "NSE:ADANIPORTS-EQ", "NSE:APOLLOHOSP-EQ", "NSE:ASIANPAINT-EQ",
+  "NSE:AXISBANK-EQ", "NSE:BAJAJ-AUTO-EQ", "NSE:BAJFINANCE-EQ", "NSE:BAJAJFINSV-EQ",
+  "NSE:BPCL-EQ", "NSE:BHARTIARTL-EQ", "NSE:BRITANNIA-EQ", "NSE:CIPLA-EQ",
+  "NSE:COALINDIA-EQ", "NSE:DIVISLAB-EQ", "NSE:DRREDDY-EQ", "NSE:EICHERMOT-EQ",
+  "NSE:GRASIM-EQ", "NSE:HCLTECH-EQ", "NSE:HDFCBANK-EQ", "NSE:HDFCLIFE-EQ",
+  "NSE:HEROMOTOCO-EQ", "NSE:HINDALCO-EQ", "NSE:HINDUNILVR-EQ", "NSE:ICICIBANK-EQ",
+  "NSE:ITC-EQ", "NSE:INDUSINDBK-EQ", "NSE:INFY-EQ", "NSE:JSWSTEEL-EQ",
+  "NSE:KOTAKBANK-EQ", "NSE:LT-EQ", "NSE:M&M-EQ", "NSE:MARUTI-EQ",
+  "NSE:NTPC-EQ", "NSE:NESTLEIND-EQ", "NSE:ONGC-EQ", "NSE:POWERGRID-EQ",
+  "NSE:RELIANCE-EQ", "NSE:SBILIFE-EQ", "NSE:SBIN-EQ", "NSE:SUNPHARMA-EQ",
+  "NSE:TCS-EQ", "NSE:TATACONSUM-EQ", "NSE:TATAMOTORS-EQ", "NSE:TATASTEEL-EQ",
+  "NSE:TECHM-EQ", "NSE:TITAN-EQ", "NSE:UPL-EQ", "NSE:ULTRACEMCO-EQ",
+  "NSE:WIPRO-EQ","NSE:MINDTECK-EQ"
+];
 
 class DataSocket extends EventEmitter {
-  constructor(fyers, accessToken) {
+  constructor(accessToken) {
     super();
-    this.fyers = fyers;
     this.accessToken = accessToken;
-    this.connected = false;
     this.socket = null;
+    this.connected = false;
+    this.symbols = [...nifty50Symbols]; // Default to all Nifty 50 symbols
+    this.lastMessageTime = {};
   }
 
   async connect() {
-    try {
-      if (!this.fyers || !this.accessToken) {
-        throw new Error('Fyers instance or access token not available');
+    if (!this.accessToken) throw new Error("Access token not provided");
+
+    this.socket = fyersDataSocket.getInstance(this.accessToken, "./logs", true);
+
+    this.socket.on("connect", () => {
+      console.log("✅ Data socket connected");
+      this.connected = true;
+      this.emit("connect");
+      
+      // Subscribe to all Nifty 50 symbols
+      this.subscribe(this.symbols);
+      this.socket.mode(this.socket.FullMode);
+      
+      // Enable auto-reconnect
+      this.socket.autoreconnect();
+    });
+
+    this.socket.on("close", () => {
+      console.log("❌ Data socket closed");
+      this.connected = false;
+      this.emit("close");
+    });
+
+    this.socket.on("error", (err) => {
+      console.error("❗ Socket error:", err);
+      this.emit("error", err);
+    });
+
+    this.socket.on("message", (msg) => {
+      try {
+        // Fyers socket already returns parsed JSON objects
+        // No need to parse if it's already an object
+        const data = typeof msg === "string" ? JSON.parse(msg) : msg;
+        
+        if (data && data.type === "sf") {
+          const symbol = data.symbol;
+          
+          // Update last message time
+          this.lastMessageTime[symbol] = Date.now();
+          
+          // Update entry time for the symbol
+          this.updateEntryTime(symbol, data);
+          
+          // Emit the message
+          this.emit("message", data);
+        }
+      } catch (error) {
+        console.error("Error processing message:", error);
       }
+    });
 
-      // Initialize WebSocket connection using fyersDataSocket
-      this.socket = fyersDataSocket.getInstance(
-        this.accessToken,
-        "./logs", // Path to save logs
-        true // Enable logging
-      );
-
-      // Set up event handlers
-      this.socket.on('connect', () => {
-        console.log('✅ Data socket connected successfully');
-        this.connected = true;
-        this.emit('connect');
-        
-        // Subscribe to market data for some default symbols
-        // You can modify this to subscribe to your desired symbols
-        this.socket.subscribe(['NSE:SBIN-EQ', 'NSE:TCS-EQ']);
-        
-        // Enable lite mode for fewer data points
-        this.socket.mode(this.socket.LiteMode);
-      });
-
-      this.socket.on('close', () => {
-        console.log('⚠️ Data socket connection closed');
-        this.connected = false;
-        this.emit('close');
-      });
-
-      this.socket.on('error', (error) => {
-        console.error('❌ Data socket error:', error);
-        this.emit('error', error);
-      });
-
-      this.socket.on('message', (message) => {
-        // Log the message to console
-        console.log('📊 Data socket message:', JSON.stringify(message, null, 2));
-        this.emit('message', message);
-      });
-
-      // Connect to WebSocket
-      this.socket.connect();
-
-      return this;
-    } catch (error) {
-      console.error('❌ Error connecting to data socket:', error);
-      this.emit('error', error);
-      throw error;
-    }
+    this.socket.connect();
+    return this;
   }
 
   disconnect() {
+    if (this.connected && this.socket) {
+      this.socket.close();
+      this.connected = false;
+      console.log("✅ Data socket disconnected");
+    }
+  }
+
+  subscribe(symbols) {
+    if (!this.connected || !this.socket) {
+      console.warn("⚠️ Cannot subscribe: socket not connected");
+      return;
+    }
+    
+    // Update the symbols list
+    this.symbols = symbols;
+    
+    // Subscribe to the symbols
+    console.log(`📈 Subscribing to ${symbols.length} symbols`);
+    this.socket.subscribe(symbols);
+  }
+
+  getLastMessageTime(symbol) {
+    return this.lastMessageTime[symbol] || 0;
+  }
+
+  isSymbolActive(symbol, maxAgeMs = 60000) { // Default 1 minute
+    const lastTime = this.getLastMessageTime(symbol);
+    return (Date.now() - lastTime) < maxAgeMs;
+  }
+
+  async updateEntryTime(symbol, data) {
     try {
-      if (this.connected && this.socket) {
-        this.socket.close();
-        this.connected = false;
-        console.log('✅ Data socket disconnected');
+      // Get current entry time data for all resolutions
+      const resolutions = ['1', '5', '15', '30', '60', '240', 'D'];
+      
+      for (const resolution of resolutions) {
+        const entryTimeData = await entryTimeService.getEntryTime(symbol, resolution);
+        const isStale = await entryTimeService.isEntryTimeStale(symbol, resolution);
+        
+        if (!entryTimeData || isStale) {
+          // Calculate new entry time based on current data
+          const lastCandleTime = Math.floor(Date.now() / 1000);
+          const entryTime = entryTimeService.calculateNextEntryTime(lastCandleTime, resolution);
+          
+          // Update entry time in database
+          await entryTimeService.updateEntryTime(symbol, resolution, entryTime, lastCandleTime);
+        }
       }
     } catch (error) {
-      console.error('❌ Error disconnecting data socket:', error);
-      throw error;
-    }
-  }
-  
-  // Method to subscribe to specific symbols
-  subscribe(symbols, isMarketDepth = false) {
-    if (this.connected && this.socket) {
-      console.log(`📈 Subscribing to symbols: ${symbols.join(', ')}`);
-      this.socket.subscribe(symbols, isMarketDepth);
-    }
-  }
-  
-  // Method to switch between lite and full mode
-  setMode(mode) {
-    if (this.connected && this.socket) {
-      if (mode === 'lite') {
-        console.log('🔄 Switching to lite mode');
-        this.socket.mode(this.socket.LiteMode);
-      } else if (mode === 'full') {
-        console.log('🔄 Switching to full mode');
-        this.socket.mode(this.socket.FullMode);
-      }
-    }
-  }
-  
-  // Method to enable auto reconnect
-  enableAutoReconnect(retryCount = 6) {
-    if (this.connected && this.socket) {
-      console.log(`🔄 Enabling auto reconnect with retry count: ${retryCount}`);
-      this.socket.autoReconnect(retryCount);
+      console.error(`Error updating entry time for ${symbol}:`, error);
     }
   }
 }
 
-async function connect(fyers, accessToken) {
-  const socket = new DataSocket(fyers, accessToken);
-  await socket.connect();
-  return socket;
+async function connect(accessToken) {
+  const ds = new DataSocket(accessToken);
+  await ds.connect();
+  return ds;
 }
 
 module.exports = {
   connect,
-  DataSocket
+  DataSocket,
+  nifty50Symbols
 };

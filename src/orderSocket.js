@@ -12,8 +12,8 @@ class OrderSocket extends EventEmitter {
 
   async connect() {
     try {
-      if (!this.fyers || !this.accessToken) {
-        throw new Error('Fyers instance or access token not available');
+      if (!this.accessToken) {
+        throw new Error('Access token not available');
       }
 
       // Initialize WebSocket connection using fyersOrderSocket
@@ -91,10 +91,23 @@ class OrderSocket extends EventEmitter {
   }
 }
 
-async function connect(fyers, accessToken) {
-  const socket = new OrderSocket(fyers, accessToken);
-  await socket.connect();
-  return socket;
+async function connect(socketToken) {
+  try {
+    if (!socketToken) {
+      throw new Error('Socket token is required');
+    }
+
+    // Create a new OrderSocket instance
+    const orderSocket = new OrderSocket(null, socketToken);
+    
+    // Connect the socket
+    await orderSocket.connect();
+    
+    return orderSocket;
+  } catch (error) {
+    console.error('Error creating order socket:', error);
+    throw error;
+  }
 }
 
 module.exports = {
