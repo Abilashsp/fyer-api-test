@@ -191,32 +191,4 @@ class FyersAuthManager {
   }
 }
 
-// Function to extract HSM key from access token
-function extractHsmKeyFromToken(accessToken) {
-  try {
-    // The access token is a JWT token
-    // The HSM key is included in the token payload
-    // We need to decode the token to extract the HSM key
-    const tokenParts = accessToken.split('.');
-    if (tokenParts.length !== 3) {
-      console.error('Invalid access token format');
-      return null;
-    }
-    
-    // Decode the payload (second part of the token)
-    const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString());
-    
-    // Extract the HSM key from the payload
-    if (payload.hsm_key) {
-      return payload.hsm_key;
-    } else {
-      console.warn('HSM key not found in access token payload');
-      return null;
-    }
-  } catch (error) {
-    console.error('Error extracting HSM key from token:', error);
-    return null;
-  }
-}
-
 module.exports = new FyersAuthManager();

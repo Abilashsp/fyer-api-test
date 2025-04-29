@@ -1,196 +1,163 @@
-const { fyersModel } = require('fyers-api-v3');
-const authManager = require('./auth2.0');
-const { EventEmitter } = require('events');
-const orderSocket = require('./orderSocket');
-const dataSocket = require('./dataSocket');
+// tradingService.js
+const { fyersModel } = require("fyers-api-v3");
+const authManager    = require("./auth2.0");
+const orderSocket    = require("./orderSocket");
+const dataSocket     = require("./dataSocket");
+const moment         = require("moment");
 
-// Simple sleep helper
-const sleep = ms => new Promise(res => setTimeout(res, ms));
+/* ------------------------------------------------------------------ */
+/* Helpers                                                            */
+/* ------------------------------------------------------------------ */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Improved rate limiter class with token bucket algorithm
+/* ------------------------------------------------------------------ */
+/* Token-bucket limiter (8 calls / minute)                            */
+/* ------------------------------------------------------------------ */
 class RateLimiter {
-  constructor(maxRequests, timeWindowMs) {
-    this.maxRequests = maxRequests;
-    this.timeWindowMs = timeWindowMs;
-    this.tokens = maxRequests;
-    this.lastRefillTime = Date.now();
-    this.refillRate = maxRequests / (timeWindowMs / 1000); // tokens per second
+  constructor(maxPerMin) {
+    this.max   = maxPerMin;
+    this.tokens= maxPerMin;
+    this.last  = Date.now();
+    this.rate  = maxPerMin / 60; // tokens per sec
   }
-
-  async waitForSlot() {
-    this.refillTokens();
-    
+  async wait() {
+    this._refill();
     if (this.tokens < 1) {
-      // Calculate wait time based on tokens needed
-      const tokensNeeded = 1;
-      const waitTime = Math.ceil((tokensNeeded / this.refillRate) * 1000);
-      console.log(`⏳ Rate limit reached, waiting ${waitTime}ms...`);
-      await sleep(waitTime);
-      return this.waitForSlot(); // Try again after waiting
+      const wait = Math.ceil((1 / this.rate) * 1000);
+      console.log(`⏳  rate-limit – waiting ${wait} ms`);
+      await sleep(wait);
+      return this.wait();
     }
-    
-    // Consume a token
     this.tokens -= 1;
   }
-
-  refillTokens() {
-    const now = Date.now();
-    const timePassed = now - this.lastRefillTime;
-    const tokensToAdd = (timePassed / 1000) * this.refillRate;
-    
-    if (tokensToAdd > 0) {
-      this.tokens = Math.min(this.maxRequests, this.tokens + tokensToAdd);
-      this.lastRefillTime = now;
+  _refill() {
+    const add = ((Date.now() - this.last) / 1000) * this.rate;
+    if (add > 0) {
+      this.tokens = Math.min(this.max, this.tokens + add);
+      this.last   = Date.now();
     }
   }
 }
+const limiter = new RateLimiter(8);
 
-// Create a rate limiter instance: 8 requests per minute (more balanced)
-const rateLimiter = new RateLimiter(8, 60 * 1000);
+/* ------------------------------------------------------------------ */
+/* Intraday look-back caps (calendar days)                            */
+/* ------------------------------------------------------------------ */
+function maxDaysFor(resMin) {
+  if (resMin <= 15)  return 30;    // 1–15 min
+  if (resMin <= 60)  return 180;   // 30 & 60 min
+  if (resMin <= 120) return 180;   // 120 min
+  return 365;                      // daily+
+}
 
+/* ------------------------------------------------------------------ */
 class TradingService {
   constructor() {
-    this.fyers = null;
-    this.orderSocket = null;
-    this.dataSocket = null;
-    this.hsmKey = null;
-    this.requestCount = 0;
-    this.lastRequestTime = 0;
-    this.cache = new Map(); // Simple in-memory cache
-    this.cacheExpiry = 5 * 60 * 1000; // 5 minutes
+    this.fyers     = null;
+    this.cache     = new Map();          // key → {ts,data}
+    this.cacheTTL  = 5 * 60_000;
+    this.lastCall  = 0;
   }
 
+  /* ---------- bootstrap ------------------------------------------ */
   async initialize() {
+    this.fyers = await authManager.initialize();
+    return this;
+  }
+
+  /* ---------- internal fetch with retries ------------------------ */
+  async _fetch(params, sym, resStr, want, retry = 0) {
+    const resMin  = /^\d+$/.test(resStr) ? Number(resStr) : null;
+    const isIntra = !!resMin;
+    const limitD  = isIntra ? maxDaysFor(resMin) : 365;
+
+    if (retry > 3) {
+      console.warn(`⚠️  max retries ${sym}@${resStr}`);
+      return { success:false, candles:[] };
+    }
+
     try {
-      // Initialize Fyers instance
-      this.fyers = await authManager.initialize();
-      
-      return this;
-    } catch (error) {
-      console.error('Error initializing trading service:', error);
-      throw error;
+      const resp = await this.fyers.getHistory(params);
+      if (!resp || resp.s !== "ok" || !Array.isArray(resp.candles))
+        throw new Error(resp?.s || "API error");
+
+      const candles = resp.candles.map(([t,o,h,l,c,v]) =>
+        ({ timestamp:t, open:o, high:h, low:l, close:c, volume:v })
+      );
+
+      if (candles.length >= want || !isIntra)
+        return { success:true, candles };
+
+      /* expand but stay inside maxDaysFor window ------------------ */
+      const earliest = moment().subtract(limitD, "days").unix();
+      const span     = Number(params.range_to) - Number(params.range_from);
+      const nextFrom = Number(params.range_from) - span * (retry + 1);
+      if (nextFrom <= earliest) return { success:true, candles };
+
+      params.range_from = String(nextFrom);
+      await sleep(1000 * 2 ** retry);
+      return this._fetch(params, sym, resStr, want, retry + 1);
+    } catch (err) {
+      console.error(`❌  fetch ${sym}@${resStr}: ${err.message}`);
+      await sleep(1000 * 2 ** retry);
+      return this._fetch(params, sym, resStr, want, retry + 1);
     }
   }
 
-  // Market Data Methods
-  async getHistoricalData(symbol, resolution = 'D', fromDate, toDate) {
-    try {
-      // Wait for a rate limit slot
-      await rateLimiter.waitForSlot();
-      
-      // Add a small delay between requests (reduced from 1000ms to 500ms)
-      const now = Date.now();
-      const timeSinceLastRequest = now - this.lastRequestTime;
-      if (timeSinceLastRequest < 500) {
-        await sleep(500 - timeSinceLastRequest);
-      }
-      this.lastRequestTime = Date.now();
-      
-      // Convert dates to epoch timestamps if they're not already
-      const fromEpoch = fromDate ? new Date(fromDate).getTime() / 1000 : undefined;
-      const toEpoch = toDate ? new Date(toDate).getTime() / 1000 : undefined;
-      
-      const params = {
-        symbol,
-        resolution,
-        date_format: '0', // 0 for epoch timestamps
-        range_from: fromEpoch,
-        range_to: toEpoch,
-        cont_flag: '1'
-      };
-      
-      console.log(`📊 Fetching historical data for ${symbol} (${resolution})`);
-      
-      // Implement retry logic with exponential backoff
-      let retries = 3; // Reduced from 4 to 3
-      let delay = 1000; // Reduced from 2000 to 1000
-      
-      while (retries > 0) {
-        try {
-          const response = await this.fyers.getHistory(params);
-          
-          // Check if the response is valid
-          if (response && response.s === 'ok' && response.candles) {
-            const result = {
-              success: true,
-              candles: response.candles.map(candle => ({
-                timestamp: candle[0],  // Epoch timestamp
-                open: candle[1],       // Opening price
-                high: candle[2],       // Highest price
-                low: candle[3],        // Lowest price
-                close: candle[4],      // Closing price
-                volume: candle[5]      // Trading volume
-              }))
-            };
-            
-            console.log(`✅ Successfully fetched ${result.candles.length} candles for ${symbol}`);
-            return result;
-          } else {
-            throw new Error('Invalid response format from Fyers API');
-          }
-        } catch (error) {
-          retries--;
-          
-          // Check if it's a rate limit error
-          if (error.code === 429 || (error.message && error.message.includes('request limit reached'))) {
-            console.warn(`⚠️ Rate limited, retrying in ${delay}ms... (${retries} attempts left)`);
-            await sleep(delay);
-            delay *= 1.5; // Reduced exponential backoff factor from 2 to 1.5
-          } else {
-            // If it's not a rate limit error, throw it
-            throw error;
-          }
-          
-          // If we've run out of retries, throw the last error
-          if (retries === 0) {
-            throw error;
-          }
-        }
-      }
-    } catch (error) {
-      console.error('Error fetching historical data:', error);
-      throw error;
-    }
+  /* ---------- public: getHistoricalData -------------------------- */
+  async getHistoricalData(symbol, resolution = "D", fromDate, toDate) {
+    /* 1. normalise resolution ----------------------------------- */
+    let res = String(resolution).toUpperCase().trim();
+
+    if (res === "240") res = "120";                // ← 4-h fallback
+    if (/^\d+M$/i.test(res)) res = res.slice(0, -1);           // 15M→15
+    if (/^\d+H$/i.test(res)) res = String(parseInt(res) * 60); // 2H→120
+    if (res === "1D") res = "D";
+    if (res !== "D" && !/^\d+$/.test(res))
+      throw new Error(`Bad resolution: ${resolution}`);
+
+    /* 2. rate-limit -------------------------------------------- */
+    await limiter.wait();
+    const lag = Date.now() - this.lastCall;
+    if (lag < 500) await sleep(500 - lag);
+    this.lastCall = Date.now();
+
+    /* 3. figure look-back window -------------------------------- */
+    const WANT    = 200;
+    const resMin  = res === "D" ? 1440 : Number(res);
+    const dayMin  = 6.5 * 60;
+    let backDays  = Math.ceil((WANT * resMin) / dayMin) * 1.3;
+    backDays      = Math.min(backDays, maxDaysFor(resMin));
+
+    const end   = toDate ? Math.min(moment(toDate).unix(), moment().unix()) : moment().unix();
+    const start = fromDate ? moment(fromDate).unix()
+                           : moment().subtract(backDays, "days").unix();
+
+    /* 4. cache --------------------------------------------------- */
+    const key = `${symbol}_${res}_${start}_${end}`;
+    const hit = this.cache.get(key);
+    if (hit && Date.now() - hit.ts < this.cacheTTL) return hit.data;
+
+    /* 5. build params & fetch ----------------------------------- */
+    const p = {
+      symbol,
+      resolution : res,
+      date_format: "0",
+      range_from : String(start),
+      range_to   : String(end),
+      cont_flag  : "1",
+    };
+
+    console.log(`📈  ${symbol}@${res}  ${moment.unix(start).format("YYYY-MM-DD")} → ${moment.unix(end).format("YYYY-MM-DD")}`);
+    const out = await this._fetch(p, symbol, res, WANT);
+    this.cache.set(key, { ts:Date.now(), data:out });
+    return out;
   }
 
-  // Profile and Account Info
-  async getProfile() {
-    try {
-      return await this.fyers.get_profile();
-    } catch (error) {
-      console.error('Error fetching profile:', error);
-      throw error;
-    }
-  }
-
-  // WebSocket Methods
-  async connectOrderSocket(socketToken) {
-    try {
-      if (!socketToken) {
-        throw new Error('Socket token is required');
-      }
-      
-      console.log('Connecting to order socket with token:', socketToken.substring(0, 10) + '...');
-      return await orderSocket.connect(socketToken);
-    } catch (error) {
-      console.error('Error connecting to order socket:', error);
-      throw error;
-    }
-  }
-
-  async connectDataSocket(socketToken) {
-    try {
-      if (!socketToken) {
-        throw new Error('Socket token is required');
-      }
-
-      console.log('Connecting to data socket with token:', socketToken.substring(0, 10) + '...');
-      return await dataSocket.connect(socketToken);
-    } catch (error) {
-      console.error('Error connecting to data socket:', error);
-      throw error;
-    }
-  }
+  /* ---------- sockets & profile --------------------------------- */
+  async getProfile()            { return this.fyers.get_profile(); }
+  async connectOrderSocket(tok) { if (!tok) throw Error("token"); return orderSocket.connect(tok); }
+  async connectDataSocket(tok)  { if (!tok) throw Error("token"); return dataSocket.connect(tok); }
 }
 
-module.exports = new TradingService(); 
+module.exports = new TradingService();

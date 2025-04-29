@@ -6,20 +6,15 @@ const entryTimeService = require('./services/entryTimeService');
 
 // Nifty 50 symbols
 const nifty50Symbols = [
-  "NSE:ADANIENT-EQ", "NSE:ADANIPORTS-EQ", "NSE:APOLLOHOSP-EQ", "NSE:ASIANPAINT-EQ",
-  "NSE:AXISBANK-EQ", "NSE:BAJAJ-AUTO-EQ", "NSE:BAJFINANCE-EQ", "NSE:BAJAJFINSV-EQ",
-  "NSE:BPCL-EQ", "NSE:BHARTIARTL-EQ", "NSE:BRITANNIA-EQ", "NSE:CIPLA-EQ",
-  "NSE:COALINDIA-EQ", "NSE:DIVISLAB-EQ", "NSE:DRREDDY-EQ", "NSE:EICHERMOT-EQ",
-  "NSE:GRASIM-EQ", "NSE:HCLTECH-EQ", "NSE:HDFCBANK-EQ", "NSE:HDFCLIFE-EQ",
-  "NSE:HEROMOTOCO-EQ", "NSE:HINDALCO-EQ", "NSE:HINDUNILVR-EQ", "NSE:ICICIBANK-EQ",
-  "NSE:ITC-EQ", "NSE:INDUSINDBK-EQ", "NSE:INFY-EQ", "NSE:JSWSTEEL-EQ",
-  "NSE:KOTAKBANK-EQ", "NSE:LT-EQ", "NSE:M&M-EQ", "NSE:MARUTI-EQ",
-  "NSE:NTPC-EQ", "NSE:NESTLEIND-EQ", "NSE:ONGC-EQ", "NSE:POWERGRID-EQ",
-  "NSE:RELIANCE-EQ", "NSE:SBILIFE-EQ", "NSE:SBIN-EQ", "NSE:SUNPHARMA-EQ",
-  "NSE:TCS-EQ", "NSE:TATACONSUM-EQ", "NSE:TATAMOTORS-EQ", "NSE:TATASTEEL-EQ",
-  "NSE:TECHM-EQ", "NSE:TITAN-EQ", "NSE:UPL-EQ", "NSE:ULTRACEMCO-EQ",
-  "NSE:WIPRO-EQ","NSE:MINDTECK-EQ"
+  "NSE:SILVERTUC-EQ",
+  "NSE:DIXON-EQ",
+  "NSE:HITACHIENERGY-EQ",
+  "NSE:IEX-EQ",
+  "NSE:BANKBARODA-EQ",
+  "NSE:FAZE3Q-EQ",
+  "NSE:AXISBANK-EQ","NSE:BAJFINANCE-EQ","NSE:DLF-EQ","NSE:DMART-EQ","NSE:BALKRISIND-EQ","NSE:AARTIPHARM-EQ","NSE:KAYNES-EQ","NSE:CIGNITITEC-EQ",
 ];
+
 
 class DataSocket extends EventEmitter {
   constructor(accessToken) {
@@ -27,7 +22,7 @@ class DataSocket extends EventEmitter {
     this.accessToken = accessToken;
     this.socket = null;
     this.connected = false;
-    this.symbols = [...nifty50Symbols]; // Default to all Nifty 50 symbols
+    this.symbols = [...nifty50Symbols]; 
     this.lastMessageTime = {};
   }
 
@@ -120,7 +115,6 @@ class DataSocket extends EventEmitter {
 
   async updateEntryTime(symbol, data) {
     try {
-      // Get current entry time data for all resolutions
       const resolutions = ['1', '5', '15', '30', '60', '240', 'D'];
       
       for (const resolution of resolutions) {
