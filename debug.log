@@ -1,0 +1,9 @@
+[2025-04-30 11:54:40] [ERROR]: uncaughtException: Cannot read properties of undefined (reading 'defaultMeta')
+TypeError: Cannot read properties of undefined (reading 'defaultMeta')
+    at log (D:\fyers-api\node_modules\winston\lib\winston\logger.js:242:45)
+    at TradingStrategy._processPending (D:\fyers-api\src\strategy.js:214:9)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+[2025-04-30 11:58:17] [INFO]: 🚀 BULLISH Signal for NSE:MANKIND-EQ at 2025-04-30 05:30:00
+[2025-04-30 11:58:47] [INFO]: ⚡ BEARISH Signal for NSE:BAJFINANCE-EQ at 2025-04-30 05:30:00
+[2025-04-30 11:59:22] [INFO]: 🚀 BULLISH Signal for NSE:BALKRISIND-EQ at 2025-04-30 05:30:00
+[2025-04-30 11:59:30] [INFO]: ⚡ BEARISH Signal for NSE:BAJFINANCE-EQ at 2025-04-30 05:30:00

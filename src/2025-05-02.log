@@ -1,0 +1,4 @@
+{"level":"error","datetime":"2025-05-02T09:45:53.862Z","message":"getHistory response","data":{"Error":{"code":-16,"message":"Could not authenticate the user","s":"error"},"inputs":{"symbol":"NSE:SBIN-EQ","resolution":"D","date_format":"1","range_from":"2024-11-01","range_to":"2025-05-01","cont_flag":"1"}},"functionName":"getHistory"}
+{"level":"error","datetime":"2025-05-02T09:49:40.175Z","message":"get_profile response","data":{"s":"error","code":-209,"message":"Please provide the validation parameter"},"functionName":"get_profile"}
+{"level":"error","datetime":"2025-05-02T09:49:44.201Z","message":"get_profile response","data":{"s":"error","code":-209,"message":"Please provide the validation parameter"},"functionName":"get_profile"}
+{"level":"error","datetime":"2025-05-02T09:55:11.709Z","message":"get_profile response","data":{"s":"error","code":-209,"message":"Please provide the validation parameter"},"functionName":"get_profile"}

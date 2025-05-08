@@ -3,7 +3,9 @@ const path = require('path');
 const fs = require('fs');
 const { fyersModel } = require('fyers-api-v3');
 const readline = require('readline');
-require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
+const dotenv = require('dotenv');
+
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 class FyersAuthManager {
   constructor() {
@@ -15,6 +17,10 @@ class FyersAuthManager {
   }
 
   async initialize() {
+    if (this.fyers) {
+      return this.fyers;
+    }
+
     const logDir = path.resolve(__dirname, '../logs');
     if (!fs.existsSync(logDir)) {
       fs.mkdirSync(logDir, { recursive: true });
@@ -50,83 +56,51 @@ class FyersAuthManager {
           this.tokenExpiryTime = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
           return accessToken;
         }
-        throw new Error('Invalid profile response');
-      } catch (error) {
-        if (error.code === -8 || error.code === -16 || error.code === -300) {
-          console.log('🔄 Token is expired or invalid, starting new authentication...');
-          // Delete the old token file if it exists
-          const tokenPath = path.resolve(__dirname, '../.token');
-          if (fs.existsSync(tokenPath)) {
-            fs.unlinkSync(tokenPath);
-          }
+      } catch (err) {
+        console.log('❌ Existing token invalid, performing fresh authentication');
           return await this.performInteractiveAuth();
         }
-        throw error;
-      }
-    } catch (error) {
-      console.error('❌ Authentication failed:', error);
-      throw error;
+    } catch (err) {
+      console.error('❌ Authentication error:', err);
+      return await this.performInteractiveAuth();
     }
   }
 
   async getAccessToken() {
-    // First try to get from environment
-    const envToken = process.env.FYERS_ACCESS_TOKEN;
-    if (envToken) {
-      return envToken;
-    }
-
-    // If not in env, try to get from file
-    const tokenPath = path.resolve(__dirname, '../.token');
+    try {
+      const tokenPath = path.resolve(__dirname, '../logs/access_token.txt');
     if (fs.existsSync(tokenPath)) {
-      const token = fs.readFileSync(tokenPath, 'utf8');
+        const token = fs.readFileSync(tokenPath, 'utf8').trim();
+        if (token) {
       return token;
     }
-
-    return null; // Return null instead of throwing error to allow interactive auth
+      }
+      return null;
+    } catch (err) {
+      console.error('Error reading access token:', err);
+      return null;
+    }
   }
 
   setAuthCode(code) {
     if (this.authCodeResolve) {
       this.authCodeResolve(code);
       this.authCodeResolve = null;
-      this.authCodePromise = null;
     }
   }
 
   async performInteractiveAuth() {
-    console.log('\n📱 Starting interactive authentication...');
-    
-    // Generate URL and prompt user
-    const url = this.fyers.generateAuthCode();
-    console.log('\n1. Visit this URL in your browser to authorize the app:');
-    console.log(url);
-    console.log('\n2. The auth code will be automatically captured from the redirect URL');
-    console.log('   Waiting for authentication... (this window will timeout in 5 minutes)\n');
-
-    // Create a new promise that will be resolved when we receive the auth code
-    this.authCodePromise = new Promise((resolve, reject) => {
-      this.authCodeResolve = resolve;
-      
-      // Add timeout after 5 minutes
-      setTimeout(() => {
-        if (this.authCodeResolve) {
-          this.authCodeResolve = null;
-          reject(new Error('Authentication timed out. Please try again.'));
-        }
-      }, 5 * 60 * 1000); // 5 minutes
-    });
-
     try {
-      // Wait for the auth code
-      const authCode = await this.authCodePromise;
+      // Generate auth URL
+      const authUrl = this.fyers.generateAuthCode();
+      console.log('🔑 Please authorize the app by visiting:', authUrl);
 
-      if (!authCode) {
-        throw new Error('Auth code is required');
-      }
+      // Wait for auth code
+      const authCode = await new Promise((resolve) => {
+      this.authCodeResolve = resolve;
+      });
 
-      // Exchange for token
-      console.log('\n🔄 Exchanging auth code for access token...');
+      // Exchange auth code for access token
       const response = await this.fyers.generate_access_token({
         client_id: process.env.FYERS_APP_ID,
         secret_key: process.env.FYERS_SECRET_KEY,
@@ -134,58 +108,53 @@ class FyersAuthManager {
       });
 
       if (response.s === 'ok' && response.access_token) {
-        const accessToken = response.access_token;
+        // Save token
+        const tokenPath = path.resolve(__dirname, '../logs/access_token.txt');
+        fs.writeFileSync(tokenPath, response.access_token);
         
-        // Save token to file for future use
-        const tokenPath = path.resolve(__dirname, '../.token');
-        fs.writeFileSync(tokenPath, accessToken);
-        console.log('✅ Access token saved successfully');
-        
-        this.fyers.setAccessToken(accessToken);
+        // Set token and expiry
+        this.fyers.setAccessToken(response.access_token);
         this.tokenExpiryTime = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
-        return accessToken;
-      }
-      
+        
+        console.log('✅ Successfully authenticated with new token');
+        return response.access_token;
+      } else {
       throw new Error('Failed to get access token: ' + JSON.stringify(response));
-    } catch (error) {
-      console.error('❌ Authentication failed:', error.message);
-      // Clean up the promise
-      this.authCodeResolve = null;
-      this.authCodePromise = null;
-      throw error;
+      }
+    } catch (err) {
+      console.error('❌ Interactive authentication failed:', err);
+      throw err;
     }
   }
 
   startTokenRefresh() {
-    // Refresh token 1 hour before expiry
+    // Clear any existing interval
+    if (this.tokenRefreshInterval) {
+      clearInterval(this.tokenRefreshInterval);
+    }
+
+    // Refresh token every 23 hours
     this.tokenRefreshInterval = setInterval(async () => {
-      if (Date.now() > (this.tokenExpiryTime - 60 * 60 * 1000)) {
         try {
           await this.authenticate();
-          console.log('Token refreshed successfully');
-        } catch (error) {
-          console.error('Token refresh failed:', error);
-        }
+      } catch (err) {
+        console.error('❌ Token refresh failed:', err);
       }
-    }, 5 * 60 * 1000); // Check every 5 minutes
+    }, 23 * 60 * 60 * 1000);
   }
 
   stopTokenRefresh() {
     if (this.tokenRefreshInterval) {
       clearInterval(this.tokenRefreshInterval);
+      this.tokenRefreshInterval = null;
     }
   }
 
   async validateToken() {
     try {
-      // In Fyers API v3, the method is get_profile instead of getProfile
       const profile = await this.fyers.get_profile();
-      return true;
-    } catch (error) {
-      if (error.code === -16 || error.code === -300) {
-        await this.authenticate();
-        return true;
-      }
+      return profile && profile.s === 'ok';
+    } catch (err) {
       return false;
     }
   }

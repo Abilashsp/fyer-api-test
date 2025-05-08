@@ -2,17 +2,10 @@
 const { fyersDataSocket } = require("fyers-api-v3");
 const { EventEmitter } = require("events");
 const WebSocket = require('ws');
-const entryTimeService = require('./services/entryTimeService');
 
 // Nifty 50 symbols
 const nifty50Symbols = [
-  "NSE:SILVERTUC-EQ",
-  "NSE:DIXON-EQ",
-  "NSE:HITACHIENERGY-EQ",
-  "NSE:IEX-EQ",
-  "NSE:BANKBARODA-EQ",
-  "NSE:FAZE3Q-EQ",
-  "NSE:AXISBANK-EQ","NSE:BAJFINANCE-EQ","NSE:DLF-EQ","NSE:DMART-EQ","NSE:BALKRISIND-EQ","NSE:AARTIPHARM-EQ","NSE:KAYNES-EQ","NSE:CIGNITITEC-EQ",
+"NSE:MOGSEC-EQ","NSE:NH-EQ","NSE:TATVA-EQ","NSE:POLYMED-EQ","NSE:RRKABEL-EQ","NSE:PAYTM-EQ","NSE:SBICARD-ER"
 ];
 
 
@@ -60,6 +53,7 @@ class DataSocket extends EventEmitter {
         // Fyers socket already returns parsed JSON objects
         // No need to parse if it's already an object
         const data = typeof msg === "string" ? JSON.parse(msg) : msg;
+        
         
         if (data && data.type === "sf") {
           const symbol = data.symbol;
@@ -113,26 +107,10 @@ class DataSocket extends EventEmitter {
     return (Date.now() - lastTime) < maxAgeMs;
   }
 
-  async updateEntryTime(symbol, data) {
-    try {
-      const resolutions = ['1', '5', '15', '30', '60', '240', 'D'];
-      
-      for (const resolution of resolutions) {
-        const entryTimeData = await entryTimeService.getEntryTime(symbol, resolution);
-        const isStale = await entryTimeService.isEntryTimeStale(symbol, resolution);
-        
-        if (!entryTimeData || isStale) {
-          // Calculate new entry time based on current data
-          const lastCandleTime = Math.floor(Date.now() / 1000);
-          const entryTime = entryTimeService.calculateNextEntryTime(lastCandleTime, resolution);
-          
-          // Update entry time in database
-          await entryTimeService.updateEntryTime(symbol, resolution, entryTime, lastCandleTime);
-        }
-      }
-    } catch (error) {
-      console.error(`Error updating entry time for ${symbol}:`, error);
-    }
+  // Entry time tracking removed with SQLite integration
+  updateEntryTime(symbol, data) {
+    // This method has been simplified as part of SQLite removal
+    // No database operations are performed anymore
   }
 }
 

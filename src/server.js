@@ -1,4 +1,4 @@
-// server.js – resolution‑smart socket server using TradingStrategy.setResolution()
+// server.js – updated to use POST for resolution + new strategy integration
 
 const express    = require("express");
 const http       = require("http");
@@ -23,15 +23,17 @@ const io     = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-let strategy;                    // TradingStrategy instance
-let currentResolution = "D";      // single source‑of‑truth timeframe
+let strategy; // Strategy instance
 
 // ───────────────────────── socket hydration ─────────────────────────
 io.on("connection", sock => {
   console.log("👋  UI connected");
   if (strategy) {
-    sock.emit("initialBullishSignals", strategy.getBullishSignals());
-    sock.emit("initialBearishSignals", strategy.getBearishSignals());
+    // Emit initial signals in the format the React client expects
+    const bullishSignals = strategy.getBullishSignals();
+    console.log(`Emitting ${bullishSignals.length} bullish signals to new client`);
+    sock.emit("initialBullishSignals", bullishSignals);
+    sock.emit("initialBearishSignals", strategy.getBearishSignals?.() || []);
   }
 });
 
@@ -45,59 +47,88 @@ app.get("/", (req, res) => {
   res.send("Server running");
 });
 
-// ───────────────────────── helper: normalize resolution ────────────
-function normalise(res) {
-  res = String(res).trim().toUpperCase();
-  if (/^\d+M$/.test(res)) return res.slice(0, -1);          // "1M" → "1"
-  if (/^\d+H$/.test(res)) return String(parseInt(res) * 60); // "2H" → "120"
-  if (res === "1D") return "D";
-  return res;
-}
-
-// ───────────────────────── change‑resolution endpoint ───────────────
-app.post("/api/change-resolution", async (req, res) => {
-  try {
-    const orig  = req.body.resolution;
-    const newRes = normalise(orig);
-    const valid = ["1", "5", "15", "30", "60", "120", "240", "D"];
-
-    if (!valid.includes(newRes)) return res.status(400).json({ error: `Invalid resolution ${orig}` });
-
-    if (newRes === currentResolution) return res.json({ success: true });
-
-    console.log(`🔄  resolution ${currentResolution} → ${newRes}`);
-    currentResolution = newRes;
-
-    if (strategy) await strategy.setResolution(newRes);
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "internal" });
-  }
-});
-
-// ───────────────────────── bootstrap ───────────────────────────────
+// ───────────────────────── bootstrap logic ──────────────────────────
 async function bootstrap() {
   try {
+    await authManager.initialize();
     await tradingService.initialize();
-    strategy = new Strategy(tradingService, io, currentResolution);
 
-    const token      = await authManager.getAccessToken();
+    strategy = new Strategy(tradingService, io);
+
+    const token = await authManager.getAccessToken();
+    if (!token) throw new Error('Failed to get access token');
+
     const dataSocket = await connectDataSocket(token);
 
     dataSocket.on("message", msg => {
+      
       if (msg?.type === "sf" && msg.symbol && msg.ltp) {
         strategy.updateRealtimeDataFromSF({ symbol: msg.symbol, ltp: msg.ltp });
       }
     });
 
-    console.log("✅ server ready on", currentResolution, "resolution");
+    // await strategy.analyzeCurrentData();
+
+    console.log("✅ server ready with multi-timeframe strategy");
   } catch (err) {
     console.error("❌ bootstrap error:", err);
+    process.exit(1);
   }
 }
 bootstrap();
+
+// ───────────────────────── API endpoints ───────────────────────────
+
+// POST /api/change-resolution — set SMA resolution dynamically
+app.post("/api/change-resolution", async (req, res) => {
+  try {
+    const { resolution } = req.body;
+
+    if (!resolution) {
+      return res.status(400).json({
+        success: false,
+        message: "Resolution parameter is required",
+        current: strategy?.getResolution?.()
+      });
+    }
+
+    const newResolution = strategy.setResolution(resolution);
+    console.log(`🔄 Changed SMA resolution to ${newResolution}`);
+
+    // Analyze data with new resolution
+    const results = await strategy.analyzeCurrentData();
+    
+    // Get updated signals
+    const bullishSignals = strategy.getBullishSignals();
+    
+    // Emit to all connected clients
+    io.emit("initialBullishSignals", bullishSignals);
+    console.log(`Emitting ${bullishSignals.length} bullish signals after resolution change to ${newResolution}`);
+    
+    // Also emit empty bearish signals to keep UI in sync
+    io.emit("initialBearishSignals", []);
+
+    return res.json({
+      success: true,
+      resolution: newResolution,
+      message: `Resolution changed to ${newResolution}`,
+      bullishSignals: bullishSignals,
+      analysisCount: results.length
+    });
+  } catch (err) {
+    console.error("❌ Change resolution error:", err.message);
+    return res.status(400).json({
+      success: false,
+      message: err.message
+    });
+  }
+});
+
+// GET /api/resolution — return current SMA resolution
+app.get("/api/resolution", (req, res) => {
+  const current = strategy?.getResolution?.();
+  return res.json({ success: true, resolution: current });
+});
 
 // ───────────────────────── start HTTP server ───────────────────────
 const PORT = process.env.PORT || 4000;
