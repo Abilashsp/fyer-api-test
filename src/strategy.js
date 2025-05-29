@@ -1,543 +1,618 @@
 /* ------------------------------------------------------------------ */
-/*  strategy.js – v5‑legacy (sig compat)                              */
-/*  • Daily‑based core conditions                                     */
-/*  • SMA‑based rules on dynamic intraday resolution                  */
-/*  • updateRealtimeDataFromSF() restored for existing server code    */
-/*  • Added TradeCard format support for UI integration                */
+/*  strategy.js – v5-legacy (sig compat, SQLite cache, unique keys)   */
 /* ------------------------------------------------------------------ */
 
 const { EventEmitter } = require("events");
-const moment       = require("moment");
-const CandleDB = require("./candleDB");
+const moment           = require("moment");
+const CandleDB         = require("./candleDB");
 
 /* Candle array indices */
-const TIMESTAMP = 0, OPEN = 1, HIGH = 2, LOW = 3, CLOSE = 4, VOLUME = 5;
+const T = 0, O = 1, H = 2, L = 3, C = 4, V = 5;
 
 /* ---------- utils ------------------------------------------------- */
 const SMA = (arr, n) =>
   arr.length < n ? null : arr.slice(-n).reduce((s, x) => s + x, 0) / n;
 
 const rollup = (daily, mode) => {
-  const map = new Map();
-  daily.forEach((candle) => {
-    const ts = candle[TIMESTAMP];
-    const o = candle[OPEN];
-    const h = candle[HIGH];
-    const l = candle[LOW];
-    const c = candle[CLOSE];
-    const v = candle[VOLUME];
-    
-    const d   = moment.unix(ts);
-    const key = mode === "W"
-      ? `${d.isoWeek()}_${d.year()}`
-      : `${d.year()}_${d.format("MM")}`;
-      
-    if (!map.has(key)) map.set(key, [ts, o, h, l, c, v]);
+  const m = new Map();
+  daily.forEach(c => {
+    const d = moment.unix(c[T]);
+    const k = mode === "W" ? `${d.isoWeek()}_${d.year()}`
+                           : `${d.year()}_${d.format("MM")}`;
+    if (!m.has(k)) m.set(k, [...c]);
     else {
-      const m = map.get(key);
-      m[HIGH] = Math.max(m[HIGH], h);
-      m[LOW] = Math.min(m[LOW], l);
-      m[CLOSE] = c;
-      m[VOLUME] += v;
+      const p = m.get(k);
+      p[H] = Math.max(p[H], c[H]);
+      p[L] = Math.min(p[L], c[L]);
+      p[C] = c[C];
+      p[V] += c[V];
     }
   });
-  return Array.from(map.values()).sort((a, b) => a[TIMESTAMP] - b[TIMESTAMP]);
+  return [...m.values()].sort((a, b) => a[T] - b[T]);
 };
 
 /* ---------- class ------------------------------------------------- */
 class Strategy extends EventEmitter {
-  /**
-   * @param {TradingService} tradingService
-   * @param {SocketIO.Server} io
-   * @param {Object} opts
-   *        opts.smaResolution – "1","5","60","120","240","D"
-   *        opts.debug         – boolean
-   */
   constructor(tradingService, io, opts = {}) {
     super();
-    this.svc    = tradingService;
-    this.io     = io;
-    this.debug  = opts.debug ?? true;
-    this.smaRes = opts.smaResolution ?? "60";
+    this.svc        = tradingService;
+    this.io         = io;
+    this.debug      = opts.debug ?? true;
+    this.smaRes     = opts.smaResolution ?? "60";
 
-    this.dailyMap = new Map(); // symbol → daily candles[]
-    this.smaMap   = new Map(); // symbol → SMA‑resolution candles[]
-    this.state    = new Map(); // symbol → last analysis
-    this.candleDB = tradingService.candleDB; // Reuse the same DB instance
-    this.lastFetchDate = new Map(); // symbol → last fetch date
+    // Data structures to store candles and state
+    this.dailyMap   = new Map();  // Daily candles: symbol → candles[]
+    this.smaMap     = new Map();  // SMA values for current resolution: symbol → {sma20, sma50, sma200}
+    this.state      = new Map();  // Strategy state: symbol → {bullish, ...}
+    
+    // SMA values for each specific resolution
+    this.resolution1mSMA = new Map();  // 1-minute SMA values
+    this.resolution5mSMA = new Map();  // 5-minute SMA values
+    this.resolution60mSMA = new Map(); // 60-minute SMA values
+    this.resolution120mSMA = new Map(); // 120-minute SMA values
+    this.resolutionDSMA = new Map();   // Daily SMA values
+
+    /* ---- FIX: always fall back to module ---------------------- */
+    this.candleDB   = tradingService.candleDB ?? CandleDB;
+
+    this.lastFetch  = new Map();           // symbol → YYYY-MM-DD
   }
 
-  /* ---------------- public --------------------------------------- */
-  getBullish() {
-    return [...this.state.values()].filter(x => x.bullish).map(x => x.symbol);
-  }
+  /* ---- helper: unique key per symbol+resolution ---------------- */
+  #makeKey(sym) { return `${sym}@${this.smaRes}`; }
 
-  /**
-   * Get bullish signals in the format required by the React client and TradeCard component
-   * @returns {Array} Array of objects with a 'trade' property containing the required data
-   */
+  /* ---------------- public helpers ----------------------------- */
+  getBullish() { return [...this.state.values()].filter(r => r.bullish).map(r => r.symbol); }
+  getBearishSignals() { return []; }
+  getResolution() { return this.smaRes; }
+
   getBullishSignals() {
-    const bullishSymbols = this.getBullish();
-    const signals = [];
-    
-    for (const symbol of bullishSymbols) {
-      const data = this.state.get(symbol);
-      if (!data) continue;
-      
-      // Extract symbol parts (e.g., "NSE:SBIN-EQ" -> exchange="NSE", symbol="SBIN")
-      const parts = symbol.split(':');
-      const exchange = parts[0] || 'NSE';
-      const stockSymbol = parts.length > 1 ? parts[1].split('-')[0] : symbol;
-      
-      // Get daily data for price information
-      const dailyData = this.dailyMap.get(symbol) || [];
-      if (dailyData.length === 0) continue;
-      
-      const latestCandle = dailyData[dailyData.length - 1];
-      const prevCandle = dailyData[dailyData.length - 2] || latestCandle;
-      
-      // Calculate price metrics
-      const price = latestCandle[CLOSE]; // Close price
-      const prevPrice = prevCandle[CLOSE];
-      const change = price - prevPrice;
-      const changePercentage = ((change / prevPrice) * 100).toFixed(2);
-      
-      // Create a trade object with the required format
-      const trade = {
-        key: symbol,
-        symbol: stockSymbol,
-        exchange: exchange,
-        type: 'BUY',
-        price: price.toFixed(2),
-        change: change.toFixed(2),
-        changePercentage: `${changePercentage}%`,
-        entryPrice: price.toFixed(2),
-        stopLoss: (price * 0.95).toFixed(2), // 5% below current price
-        target: (price * 1.1).toFixed(2),    // 10% above current price
-        liveReturns: '0.00%',
-        estimatedGains: '10.00%',
-        entryTime: moment.unix(latestCandle[TIMESTAMP]).format('HH:mm'),
-        entryDate: moment.unix(latestCandle[TIMESTAMP]).format('DD-MM-YYYY'),
-        isProfit: change >= 0
-      };
-      
-      // Wrap the trade object in an object with a 'trade' property
-      signals.push({ trade });
+    const out = [];
+    for (const symbol of this.getBullish()) {
+      const daily = this.dailyMap.get(symbol);
+      if (!daily?.length) continue;
+
+      const latest = daily.at(-1);
+      const prev   = daily.at(-2) || latest;
+      const price  = latest[C];
+      const diff   = price - prev[C];
+      const pct    = ((diff / prev[C]) * 100).toFixed(2);
+
+      const [exch, codeRaw] = symbol.split(":");
+      const stock = codeRaw ? codeRaw.split("-")[0] : symbol;
+
+      out.push({
+        trade: {
+          key: this.#makeKey(symbol),
+          resolution: this.smaRes,
+          symbol: stock,
+          exchange: exch || "NSE",
+          type: "BUY",
+          price: price.toFixed(2),
+          change: diff.toFixed(2),
+          changePercentage: `${pct}%`,
+          entryPrice: price.toFixed(2),
+          stopLoss: (price * 0.95).toFixed(2),
+          target: (price * 1.10).toFixed(2),
+          liveReturns: "0.00%",
+          estimatedGains: "10.00%",
+          entryTime: moment.unix(latest[T]).format("HH:mm"),
+          entryDate: moment.unix(latest[T]).format("DD-MM-YYYY"),
+          isProfit: diff >= 0
+        }
+      });
     }
-    
-    return signals;
+    return out;
   }
-  
-  getBearishSignals() {
-    return []; // Placeholder for API compatibility
-  }
-  
-  /**
-   * Get the current SMA resolution used for analysis
-   * @returns {string} Current resolution (e.g., "1", "5", "60", "120", "D")
-   */
-  getResolution() {
-    return this.smaRes;
-  }
-  
-  /**
-   * Set a new SMA resolution for analysis and clear cached data
-   * @param {string} resolution - New resolution to use
-   * @returns {string} Normalized resolution that was set
-   */
-  setResolution(resolution) {
-    // Normalize resolution format
-    let res = String(resolution).toUpperCase().trim();
-    
-    // Apply the same normalization logic used in tradingService
-    if (res === "240") res = "120";                         // 4H → 2H fallback
-    if (/^\d+M$/i.test(res)) res = res.slice(0, -1);       // 15M → 15
-    if (/^\d+H$/i.test(res)) res = String(parseInt(res) * 60); // 2H → 120
-    if (res === "1D") res = "D";
-    
-    // Validate the resolution format
-    if (res !== "D" && res !== "W" && res !== "M" && !/^\d+$/.test(res)) {
-      throw new Error(`Invalid resolution format: ${resolution}`);
-    }
-    
-    // Only change if different from current resolution
-    if (res !== this.smaRes) {
-      console.log(`Changing SMA resolution from ${this.smaRes} to ${res}`);
-      this.smaRes = res;
-      
-      // Clear SMA data cache to force re-fetching with new resolution
+
+  /* ---------------- resolution management ---------------------- */
+  setResolution(res) {
+    let r = String(res).toUpperCase().trim();
+    if (r === "240") r = "120";
+    if (/^\d+M$/i.test(r)) r = r.slice(0, -1);
+    if (/^\d+H$/i.test(r)) r = String(parseInt(r) * 60);
+    if (r === "1D") r = "D";
+    if (r !== "D" && r !== "W" && r !== "M" && !/^\d+$/.test(r))
+      throw new Error(`Invalid resolution: ${res}`);
+
+    if (r !== this.smaRes) {
+      console.log(`Changing SMA resolution ${this.smaRes} → ${r}`);
+      this.smaRes = r;
       this.smaMap.clear();
-      
-      // If using database, check for cached data with new resolution
-      if (this.useDatabase) {
-        console.log(`Checking SQLite database for existing data with resolution ${res}`);
-      }
     }
-    
     return this.smaRes;
   }
 
-  /** Legacy name kept for WebSocket tick handler */
-  async updateRealtimeDataFromSF({ symbol, ltp }) {
-    return this.tick(symbol, ltp);
-  }
+  /* legacy alias -------------------------------------------------- */
+  async updateRealtimeDataFromSF({ symbol, ltp }) { return this.tick(symbol, ltp); }
 
-  /** Preferred shorter alias (also used internally) */
+  /* ---------------- live tick ----------------------------------- */
   async tick(symbol, ltp) {
     await this.#ensureDaily(symbol);
     await this.#ensureSMA(symbol);
 
-    // live‑update today's candle so strategy stays up‑to‑date
     const daily = this.dailyMap.get(symbol);
-    const dNow  = daily[daily.length - 1];
-    const previousClose = dNow[CLOSE]; // Store previous close for comparison
-    
-    // Update the candle with the new price
-    dNow[CLOSE] = ltp;
-    if (ltp > dNow[HIGH]) dNow[HIGH] = ltp;
-    if (ltp < dNow[LOW]) dNow[LOW] = ltp;
-    
-    // If using database, update the latest candle in SQLite too
-    if (this.useDatabase) {
-      // Store the updated candle in the database
-      candleDB.storeCandles(symbol, "D", [dNow]);
-    }
+    const tdy   = daily.at(-1);
+    const prevC = tdy[C];
 
-    // If significant price move, analyze immediately
-    const priceChangePercent = Math.abs((ltp - previousClose) / previousClose * 100);
-    const significantMove = priceChangePercent >= 0.5; // 0.5% price move threshold
-    
-    // Always analyze with priority for real-time signals
-    await this.#analyze(symbol, significantMove);
+    tdy[C] = ltp;
+    if (ltp > tdy[H]) tdy[H] = ltp;
+    if (ltp < tdy[L]) tdy[L] = ltp;
+
+    this.candleDB.storeCandles(symbol, "D", [tdy]);
+
+    const pct = Math.abs((ltp - prevC) / prevC * 100);
+    await this.#analyze(symbol, pct >= 0.5);
   }
 
-  /**
-   * Analyze all symbols in the current dataset with the current resolution
-   * Used when resolution changes to refresh signals
-   * @returns {Promise<Array>} - Array of analysis results
-   */
-  async analyzeCurrentData() {
-    const symbols = Array.from(this.dailyMap.keys());
-    console.log(`Analyzing ${symbols.length} symbols with resolution ${this.smaRes}`);
-    
-    // If no symbols are loaded yet, return empty array
-    if (symbols.length === 0) {
-      return [];
-    }
-    
-    // Get current prices from daily data for each symbol
-    const results = [];
-    
-    // First ensure SMA data is loaded with current resolution
-    for (const symbol of symbols) {
-      // Clear existing SMA data to force refresh with new resolution
-      this.smaMap.delete(symbol);
-      // Load new SMA data with current resolution
-      await this.#ensureSMA(symbol);
-    }
-    
-    console.log(`🔍 Checking for bullish signals across all symbols...`);
-    
-    // Analyze each symbol
-    for (const symbol of symbols) {
-      const daily = this.dailyMap.get(symbol);
-      // Use latest closing price for analysis
-      const currentPrice = daily[daily.length - 1][CLOSE];
-      await this.tick(symbol, currentPrice);
-      
-      // Keep track of analysis results
-      const result = this.state.get(symbol);
-      if (result) results.push(result);
-    }
-    
-    // Count and log bullish symbols
-    const bullishCount = results.filter(r => r.bullish).length;
-    if (bullishCount > 0) {
-      console.log(`🔔 Found ${bullishCount} bullish symbol(s)! UI will be updated immediately.`);
-    } else {
-      console.log(`No bullish symbols found in current analysis.`);
-    }
-    
-    return results;
-  }
-
-  /* ---------------- internals ------------------------------------ */
-  async #analyze(symbol, isPriorityCheck = false) {
-    const daily = this.dailyMap.get(symbol);
-    const smaData = this.smaMap.get(symbol);
-    
-    // Enhanced data sufficiency check
-    if (!daily || !smaData) return;
-    if (daily.length < 10) return; // Need at least 10 days of daily data
-
-    // ---------- daily‑based core conditions ----------
-    const today = daily.at(-1);
-    const prev7 = daily.slice(-8, -1);
-    
-    // Check if today's range is greater than previous 7 days
-    const rangeT = today[HIGH] - today[LOW];
-    const rangeOK = prev7.every((candle) => rangeT > (candle[HIGH] - candle[LOW]));
-
-    const closeGTopen = today[CLOSE] > today[OPEN];
-    const closeGTyest = today[CLOSE] > prev7.at(-1)[CLOSE];
-    const volYestOK = prev7.at(-1)[VOLUME] > 10_000;
-
-    // Get weekly and monthly data from daily candles
-    const wkBull = (() => {
-      const w = rollup(daily, "W").at(-1);
-      return w ? w[CLOSE] > w[OPEN] : false;
-    })();
-    
-    const moBull = (() => {
-      const m = rollup(daily, "M").at(-1);
-      return m ? m[CLOSE] > m[OPEN] : false;
-    })();
-
-    // ---------- SMA conditions using cached values ----
-    const smaOK = smaData.sma20 > smaData.sma50 && smaData.sma50 > smaData.sma200;
-
-    // ---------- verdict --------------------------------
-    const bullish = rangeOK && closeGTopen && closeGTyest &&
-                    volYestOK && wkBull && moBull && smaOK;
-
-    this.#diff(symbol, { 
-      symbol, bullish, rangeOK, closeGTopen, closeGTyest,
-      volYestOK, wkBull, moBull, smaOK, 
-      s20: smaData.sma20, s50: smaData.sma50, s200: smaData.sma200,
-      ma20_gt_ma200: smaData.sma20 > smaData.sma200,
-      isPriorityCheck
-    });
-  }
-
-  #diff(symbol, next) {
-    const prev = this.state.get(symbol);
-    this.state.set(symbol, next);
-    
-    // Determine if this is a real-time priority check
-    const isPriorityCheck = next.isPriorityCheck || false;
-    
-    // Enhanced debugging - show which specific conditions are failing
-    if (this.debug) {
-      if (symbol.includes('AXISGOLD') || symbol.includes('NH')) {
-        console.log(`--------- DETAILED DEBUG for ${symbol} ${isPriorityCheck ? '[PRIORITY]' : ''} ---------`);
-        console.log(`rangeOK: ${next.rangeOK ? '✅' : '❌'}`);
-        console.log(`closeGTopen: ${next.closeGTopen ? '✅' : '❌'}`);
-        console.log(`closeGTyest: ${next.closeGTyest ? '✅' : '❌'}`);
-        console.log(`volYestOK: ${next.volYestOK ? '✅' : '❌'}`);
-        console.log(`wkBull: ${next.wkBull ? '✅' : '❌'}`);
-        console.log(`moBull: ${next.moBull ? '✅' : '❌'}`);
-        console.log(`smaOK: ${next.smaOK ? '✅' : '❌'}`);
-        console.log(`SMA values - s20: ${next.s20}, s50: ${next.s50}, s200: ${next.s200}`);
-        console.log(`Overall ${symbol}: ${next.bullish ? "✅" : "❌"}`);
-        console.log(`-----------------------------------------`);
-      } else {
-        // Regular debug log for other symbols
-        console.log(`${symbol}${isPriorityCheck ? ' [PRIORITY]' : ''}: ${next.bullish ? "✅" : "❌"}`);
-      }
-    }
-
-    // For emitting a single bullish signal, we need to create a formatted trade object
-    if (next.bullish && !prev?.bullish) {
-      // Get daily data for price information to create trade object
-      const dailyData = this.dailyMap.get(symbol) || [];
-      if (dailyData.length > 0) {
-        const latestCandle = dailyData[dailyData.length - 1];
-        const prevCandle = dailyData[dailyData.length - 2] || latestCandle;
-        
-        // Extract symbol parts
-        const parts = symbol.split(':');
-        const exchange = parts[0] || 'NSE';
-        const stockSymbol = parts.length > 1 ? parts[1].split('-')[0] : symbol;
-        
-        // Calculate price metrics
-        const price = latestCandle[CLOSE]; // Close price
-        const prevPrice = prevCandle[CLOSE];
-        const change = price - prevPrice;
-        const changePercentage = ((change / prevPrice) * 100).toFixed(2);
-        
-        // Create trade object
-        const tradeSignal = {
-          trade: {
-            key: symbol,
-            symbol: stockSymbol,
-            exchange: exchange,
-            type: 'BUY',
-            price: price.toFixed(2),
-            change: change.toFixed(2),
-            changePercentage: `${changePercentage}%`,
-            entryPrice: price.toFixed(2),
-            stopLoss: (price * 0.95).toFixed(2),
-            target: (price * 1.1).toFixed(2),
-            liveReturns: '0.00%',
-            estimatedGains: '10.00%',
-            entryTime: moment.unix(latestCandle[0]).format('HH:mm'),
-            entryDate: moment.unix(latestCandle[0]).format('DD-MM-YYYY'),
-            isProfit: change >= 0
-          }
-        };
-        
-        // Emit both local event and socket.io event for UI updates
-        this.emit("bullish", tradeSignal);
-        
-        // Force immediate UI update through socket.io
-        if (this.io) {
-          console.log(`🚨 BULLISH SIGNAL DETECTED for ${symbol}! Sending to UI immediately...`);
-          this.io.emit("bullishSignal", tradeSignal);
-          
-          // Send a refresh event to ensure UI is updated
-          this.io.emit("signalRefresh", { timestamp: Date.now() });
-        }
-      } else {
-        // Fallback if no candle data available
-        this.emit("bullish", next);
-        
-        // Force immediate UI update through socket.io
-        if (this.io) {
-          console.log(`🚨 BULLISH SIGNAL DETECTED for ${symbol}! Sending to UI immediately...`);
-          this.io.emit("bullishSignal", { trade: { key: symbol, symbol, isProfit: true } });
-          
-          // Send a refresh event to ensure UI is updated
-          this.io.emit("signalRefresh", { timestamp: Date.now() });
-        }
-      }
-    }
-    
-    if (!next.bullish && prev?.bullish) {
-      console.log(`❌ Symbol ${symbol} no longer bullish. Clearing signal.`);
-      this.emit("clear", next);
-      
-      // Force immediate UI update for clearing signal
-      if (this.io) {
-        this.io.emit("clear", next);
-        // Send a refresh event to ensure UI is updated
-        this.io.emit("signalRefresh", { timestamp: Date.now() });
-      }
-    }
-  }
-
-
-  /* ---------- data‑fetch helpers -------------------- */
+  /* ---------------- history loaders ---------------------------- */
   async #ensureDaily(symbol) {
-    const today = moment().format('YYYY-MM-DD');
-    const lastFetch = this.lastFetchDate.get(symbol);
+    const today = moment().format("YYYY-MM-DD");
+    if (this.lastFetch.get(`${symbol}_D`) === today && this.dailyMap.has(symbol)) return;
 
-    // Check if we need to refresh data (new day or no data)
-    const needsRefresh = !lastFetch || lastFetch !== today;
+    const endTs   = moment().unix();
+    const startTs = moment().subtract(300, "days").unix();
+    let candles   = this.candleDB.getCandles(symbol, "D", startTs, endTs);
 
-    if (!needsRefresh) {
-      // Use cached data if we already fetched today
-      if (!this.dailyMap.has(symbol)) {
-        // Get from SQLite if not in memory
-        const endTs = moment().unix();
-        const startTs = moment().subtract(300, 'days').unix();
-        const candles = this.candleDB.getDailyCandles(symbol, startTs, endTs);
-        if (candles.length > 0) {
-          this.dailyMap.set(symbol, candles);
-        }
-      }
-      return;
+    if (!candles.length || !moment.unix(candles.at(-1)[T]).isSame(today, "day")) {
+      const { candles: api } = await this.svc.getHistoricalData(symbol, "D", 300);
+      candles = api;
+      this.candleDB.storeCandles(symbol, "D", api);
     }
-
-    // For new symbols or new day, check SQLite first
-    const endTs = moment().unix();
-    const startTs = moment().subtract(300, 'days').unix();
-    const candles = this.candleDB.getDailyCandles(symbol, startTs, endTs);
-    
-    // Check if we have recent data (within last 24 hours)
-    const hasRecentData = candles.length > 0 && 
-      moment.unix(candles[candles.length - 1][0]).isAfter(moment().subtract(24, 'hours'));
-
-    if (candles.length === 0 || !hasRecentData) {
-      // Fetch from API if no data or data is old
-      console.log(`🔄 Fetching daily data for ${symbol} from API (${!candles.length ? 'new symbol' : 'data refresh needed'})`);
-      const { candles: apiCandles } = await this.svc.getHistoricalData(symbol, "D", 300);
-      this.dailyMap.set(symbol, apiCandles);
-      
-      // Cache SMAs for common periods
-      this.candleDB.cacheSMA(symbol, "D", 20, apiCandles);
-      this.candleDB.cacheSMA(symbol, "D", 50, apiCandles);
-      this.candleDB.cacheSMA(symbol, "D", 200, apiCandles);
-    } else {
-      this.dailyMap.set(symbol, candles);
-    }
-    
-    // Update last fetch date
-    this.lastFetchDate.set(symbol, today);
+    this.dailyMap.set(symbol, candles);
+    this.lastFetch.set(`${symbol}_D`, today);
   }
 
   async #ensureSMA(symbol) {
-    const today = moment().format('YYYY-MM-DD');
-    const lastFetch = this.lastFetchDate.get(symbol);
+    const tag   = `${symbol}_${this.smaRes}`;
+    const today = moment().format("YYYY-MM-DD");
+    
+    // Return early if we already have current data in memory for current resolution
+    // This is our first cache check - memory cache
+    if (this.lastFetch.get(tag) === today && this.smaMap.has(symbol)) {
+      console.log(`Using memory-cached SMA values for ${symbol} @ ${this.smaRes}`);
+      return;
+    }
 
-    // Check if we need to refresh data (new day or no data)
-    const needsRefresh = !lastFetch || lastFetch !== today;
-
-    if (!needsRefresh) {
-      // Use cached data if we already fetched today
-      if (!this.smaMap.has(symbol)) {
-        // Try to get SMA values from cache
-        const sma20 = this.candleDB.getCachedSMA(symbol, this.smaRes, 20);
-        const sma50 = this.candleDB.getCachedSMA(symbol, this.smaRes, 50);
-        const sma200 = this.candleDB.getCachedSMA(symbol, this.smaRes, 200);
-
-        if (sma20 && sma50 && sma200) {
-          this.smaMap.set(symbol, {
-            sma20: sma20.value,
-            sma50: sma50.value,
-            sma200: sma200.value
+    // Try to get SMA values directly from the database view (most efficient)
+    try {
+      // This uses our optimized view-based query
+      const allSMAs = this.candleDB.getAllSMA(symbol, this.smaRes);
+      if (allSMAs.sma20 !== null && allSMAs.sma50 !== null && allSMAs.sma200 !== null) {
+        // We have all the values we need in the database
+        this.smaMap.set(symbol, {
+          sma20 : allSMAs.sma20,
+          sma50 : allSMAs.sma50,
+          sma200: allSMAs.sma200
+        });
+        console.log(`Using database-cached SMA values for ${symbol} @ ${this.smaRes}`);
+        this.lastFetch.set(tag, today);
+        
+        // Now ensure we have SMA values for all key timeframes
+        // But we'll use a non-API fetching approach when possible
+        await this.#ensureAllTimeframeSMAs(symbol, true); // true = prioritize cache
+        return;
+      }
+    } catch (err) {
+      console.warn(`Error getting cached SMA values: ${err.message}`);
+    }
+    
+    // Fallback to individual SMA queries if the view approach failed
+    const sma20  = this.candleDB.getCachedSMA(symbol, this.smaRes, 20);
+    const sma50  = this.candleDB.getCachedSMA(symbol, this.smaRes, 50);
+    const sma200 = this.candleDB.getCachedSMA(symbol, this.smaRes, 200);
+    
+    // Check if all SMAs are available for current resolution
+    const allSmasAvailable = sma20?.value && sma50?.value && sma200?.value;
+    
+    if (allSmasAvailable) {
+      // We have all the values from individual queries
+      this.smaMap.set(symbol, {
+        sma20 : sma20.value,
+        sma50 : sma50.value,
+        sma200: sma200.value
+      });
+      console.log(`Using individual cached SMA values for ${symbol} @ ${this.smaRes}`);
+      this.lastFetch.set(tag, today);
+      
+      // Now ensure we have SMA values for all key timeframes
+      await this.#ensureAllTimeframeSMAs(symbol, true); // true = prioritize cache
+      return;
+    }
+    
+    // If we get here, we need to fetch new data from the API
+    console.log(`Fetching new candles for ${symbol} @ ${this.smaRes} (missing SMAs in cache)`);
+    try {
+      const { candles } = await this.svc.getHistoricalData(symbol, this.smaRes, 300);
+      
+      // Cache the new candles with SMA calculations
+      if (candles && candles.length > 0) {
+        this.candleDB.cacheSMA(symbol, this.smaRes, 20, candles);
+        this.candleDB.cacheSMA(symbol, this.smaRes, 50, candles);
+        this.candleDB.cacheSMA(symbol, this.smaRes, 200, candles);
+        
+        // Get the updated SMA values from the database
+        const updatedSMAs = this.candleDB.getAllSMA(symbol, this.smaRes);
+        this.smaMap.set(symbol, {
+          sma20 : updatedSMAs.sma20,
+          sma50 : updatedSMAs.sma50,
+          sma200: updatedSMAs.sma200
+        });
+      } else {
+        console.warn(`No candles returned for ${symbol} @ ${this.smaRes}`);
+      }
+    } catch (fetchErr) {
+      console.error(`Error fetching candles for ${symbol} @ ${this.smaRes}: ${fetchErr.message}`);
+    }
+    
+    this.lastFetch.set(tag, today);
+    
+    // Now ensure we have SMA values for all key timeframes
+    await this.#ensureAllTimeframeSMAs(symbol, true); // true = prioritize cache
+  }
+  
+  async #ensureAllTimeframeSMAs(symbol) {
+    const today = moment().format("YYYY-MM-DD");
+    const tag = `${symbol}_allTimeframes`;
+    
+    // Skip if we already have current data for all timeframes
+    if (this.lastFetch.get(tag) === today && 
+        this.resolution1mSMA.has(symbol) && 
+        this.resolution5mSMA.has(symbol) && 
+        this.resolution60mSMA.has(symbol) && 
+        this.resolution120mSMA.has(symbol) && 
+        this.resolutionDSMA.has(symbol)) {
+      console.log(`Using cached SMA values for ${symbol} across all timeframes`);
+      return;
+    }
+    
+    // Attempt to get all SMA values from the database views
+    try {
+      console.log(`Fetching all timeframe SMA values for ${symbol} from database views...`);
+      
+      // Use the new optimized method that queries all timeframes at once
+      const allTimeframeSMAs = this.candleDB.getAllTimeframeSMAs(symbol);
+      
+      // Check if we have all SMA values for all resolutions
+      const allAvailable = Object.values(allTimeframeSMAs).every(sma => 
+        sma.sma20 !== null && sma.sma50 !== null && sma.sma200 !== null
+      );
+      
+      if (allAvailable) {
+        // Store values in the maps
+        this.resolution1mSMA.set(symbol, allTimeframeSMAs['1']);
+        this.resolution5mSMA.set(symbol, allTimeframeSMAs['5']);
+        this.resolution60mSMA.set(symbol, allTimeframeSMAs['60']);
+        this.resolution120mSMA.set(symbol, allTimeframeSMAs['120']);
+        this.resolutionDSMA.set(symbol, allTimeframeSMAs['D']);
+        
+        console.log(`Got all SMA values for ${symbol} from database views`);
+        this.lastFetch.set(tag, today);
+        return;
+      }
+      
+      console.log(`Some SMA values missing for ${symbol}, fetching candles...`);
+    } catch (err) {
+      console.error(`Error fetching SMA values for ${symbol} from views: ${err.message}`);
+    }
+    
+    // If we couldn't get all values from the views, fetch candles for the missing ones
+    const timeframes = [
+      { res: "1", map: this.resolution1mSMA },     // 1-minute
+      { res: "5", map: this.resolution5mSMA },     // 5-minute
+      { res: "60", map: this.resolution60mSMA },   // 60-minute (1-hour)
+      { res: "120", map: this.resolution120mSMA }, // 120-minute (2-hour)
+      { res: "D", map: this.resolutionDSMA }       // Daily
+    ];
+    
+    for (const { res, map } of timeframes) {
+      const timeframeTag = `${symbol}_${res}`;
+      
+      // Skip if we already have current data for this timeframe
+      if (this.lastFetch.get(timeframeTag) === today && map.has(symbol)) continue;
+      
+      // Check if we have SMAs for this timeframe using the new view-based method
+      const smaValues = this.candleDB.getAllSMA(symbol, res);
+      const allSmasAvailable = smaValues.sma20 !== null && smaValues.sma50 !== null && smaValues.sma200 !== null;
+      
+      if (allSmasAvailable) {
+        // Use the values from the view
+        map.set(symbol, {
+          sma20: smaValues.sma20,
+          sma50: smaValues.sma50,
+          sma200: smaValues.sma200
+        });
+        console.log(`Using SMA values from view for ${symbol} @ ${res}`);
+        this.lastFetch.set(timeframeTag, today);
+        continue;
+      }
+      
+      // We need to fetch candles and calculate SMAs
+      console.log(`Fetching candles for ${symbol} @ ${res} (missing SMAs in cache)`);
+      
+      // Determine appropriate candle count based on timeframe
+      // Remember Fyers API limits: 1-15m (30 days), 30-60m (180 days), 120m (180 days), D+ (365 days)
+      let lookback = 300;
+      
+      // For 1m and 5m, we need enough data for SMA calculations. Fyers allows max 30 days for 1-15m
+      if (res === "1") {
+        lookback = 2000; // ~33 hours (at least SMA20 + some buffer - Fyers may limit further)
+        console.log(`${symbol} @ ${res}: Using lookback=${lookback} (needed for SMA calculations)`);
+      } 
+      else if (res === "5") {
+        lookback = 2000; // ~166 hours/~7 days (provides sufficient data for SMA200)
+        console.log(`${symbol} @ ${res}: Using lookback=${lookback} (needed for SMA calculations)`);
+      }
+      else if (res === "60") lookback = 800; // ~33 days (sufficient for SMA50, nearing max for SMA200)
+      else if (res === "120") lookback = 800; // ~66 days (sufficient for SMA200)
+      else if (res === "D") lookback = 365;  // Daily: ~1 year (sufficient for SMA20, SMA50, SMA200)
+      
+      try {
+        const { candles } = await this.svc.getHistoricalData(symbol, res, lookback);
+        
+        if (candles && candles.length > 0) {
+          this.candleDB.cacheSMA(symbol, res, 20, candles);
+          this.candleDB.cacheSMA(symbol, res, 50, candles);
+          this.candleDB.cacheSMA(symbol, res, 200, candles);
+          
+          // Get the updated SMA values using the optimized method
+          const updatedSMAs = this.candleDB.getAllSMA(symbol, res);
+          map.set(symbol, {
+            sma20: updatedSMAs.sma20,
+            sma50: updatedSMAs.sma50,
+            sma200: updatedSMAs.sma200
           });
+          
+          console.log(`Stored SMA values for ${symbol} @ ${res}`);
+        } else {
+          console.warn(`No candles returned for ${symbol} @ ${res}`);
         }
+      } catch (err) {
+        console.error(`Error fetching candles for ${symbol} @ ${res}: ${err.message}`);
+      }
+      
+      this.lastFetch.set(timeframeTag, today);
+    }
+    
+    // Update the overall tag if we have all values
+    if (this.resolution1mSMA.has(symbol) && 
+        this.resolution5mSMA.has(symbol) && 
+        this.resolution60mSMA.has(symbol) && 
+        this.resolution120mSMA.has(symbol) && 
+        this.resolutionDSMA.has(symbol)) {
+      this.lastFetch.set(tag, today);
+    }
+  }
+
+  /* ---------------- analysis ----------------------------------- */
+  async #analyze(symbol, isPriority = false) {
+    const daily = this.dailyMap.get(symbol);
+    const smaBuf = this.smaMap.get(symbol);
+    if (!daily || daily.length < 10 || !smaBuf) {
+      if (this.debug) {
+        console.log(`${symbol}: Not enough data for analysis (daily: ${daily?.length || 0}, smaBuf: ${!!smaBuf})`);
       }
       return;
     }
 
-    // For new symbols or new day, check cache first
-    const sma20 = this.candleDB.getCachedSMA(symbol, this.smaRes, 20);
-    const sma50 = this.candleDB.getCachedSMA(symbol, this.smaRes, 50);
-    const sma200 = this.candleDB.getCachedSMA(symbol, this.smaRes, 200);
+    // Get the latest candle and previous 7 days
+    const today = daily.at(-1);
+    const todayRange = today[H] - today[L]; // Today's high-low range
 
-    // Check if we have recent SMA data
-    const hasRecentSMAs = sma20 && sma50 && sma200 && 
-      moment.unix(sma20.ts).isAfter(moment().subtract(24, 'hours'));
-
-    if (hasRecentSMAs) {
-      // Use cached SMAs if they're recent
-      this.smaMap.set(symbol, {
-        sma20: sma20.value,
-        sma50: sma50.value,
-        sma200: sma200.value
-      });
-    } else {
-      // Fetch new data if SMAs are missing or old
-      console.log(`🔄 Fetching ${this.smaRes} data for ${symbol} from API (${!sma20 ? 'new symbol' : 'SMA refresh needed'})`);
-      const { candles } = await this.svc.getHistoricalData(symbol, this.smaRes, 300);
+    // Check individual range comparisons against previous 7 days
+    // (Daily High - Daily Low) greater than (n days ago High - n days ago Low)
+    const rangeComparisons = [];
+    for (let i = 1; i <= 7; i++) {
+      if (daily.length < i + 1) continue; // Skip if we don't have enough data
       
-      // Calculate and cache SMAs
-      this.candleDB.cacheSMA(symbol, this.smaRes, 20, candles);
-      this.candleDB.cacheSMA(symbol, this.smaRes, 50, candles);
-      this.candleDB.cacheSMA(symbol, this.smaRes, 200, candles);
-      
-      // Store in memory
-      this.smaMap.set(symbol, {
-        sma20: this.candleDB.getCachedSMA(symbol, this.smaRes, 20).value,
-        sma50: this.candleDB.getCachedSMA(symbol, this.smaRes, 50).value,
-        sma200: this.candleDB.getCachedSMA(symbol, this.smaRes, 200).value
+      const prevCandle = daily.at(-1 - i);
+      const prevRange = prevCandle[H] - prevCandle[L];
+      rangeComparisons.push({
+        day: i,
+        today: todayRange,
+        prev: prevRange,
+        result: todayRange > prevRange
       });
     }
     
-    // Update last fetch date
-    this.lastFetchDate.set(symbol, today);
+    // Must pass all range comparisons
+    const rangeOK = rangeComparisons.every(comp => comp.result);
+
+    // Daily Close greater than Daily Open
+    const closeGTopen = today[C] > today[O];
+    
+    // Daily Close greater than 1 day ago Close
+    const closeGTyest = today[C] > daily.at(-2)[C];
+    
+    // 1 day ago Volume greater than 10000
+    const volYestOK = daily.at(-2)[V] > 10_000;
+    
+    // Weekly Close greater than Weekly Open
+    const weeklyData = rollup(daily, "W");
+    const wkBull = weeklyData.length > 0 && weeklyData.at(-1)[C] > weeklyData.at(-1)[O];
+    
+    // Monthly Close greater than Monthly Open
+    const monthlyData = rollup(daily, "M");
+    const moBull = monthlyData.length > 0 && monthlyData.at(-1)[C] > monthlyData.at(-1)[O];
+
+    // ==== Multi-timeframe SMA Analysis ==== //
+    // Check if we have SMA values for all timeframes
+    const sma1m = this.resolution1mSMA.get(symbol);
+    const sma5m = this.resolution5mSMA.get(symbol);
+    const sma60m = this.resolution60mSMA.get(symbol);
+    const sma120m = this.resolution120mSMA.get(symbol);
+    const smaD = this.resolutionDSMA.get(symbol);
+    
+    // Create an object to store SMA conditions for each timeframe
+    const smaConds = {};
+    
+    // Check 1-minute SMA condition: SMA20 > SMA50 > SMA200
+    smaConds.minute1 = sma1m && sma1m.sma20 > sma1m.sma50 && sma1m.sma50 > sma1m.sma200;
+    
+    // Check 5-minute SMA condition: SMA20 > SMA50 > SMA200
+    smaConds.minute5 = sma5m && sma5m.sma20 > sma5m.sma50 && sma5m.sma50 > sma5m.sma200;
+    
+    // Check 60-minute SMA condition: SMA20 > SMA50 > SMA200
+    smaConds.minute60 = sma60m && sma60m.sma20 > sma60m.sma50 && sma60m.sma50 > sma60m.sma200;
+    
+    // Check 120-minute SMA condition: SMA20 > SMA50 > SMA200
+    smaConds.minute120 = sma120m && sma120m.sma20 > sma120m.sma50 && sma120m.sma50 > sma120m.sma200;
+    
+    // Check Daily SMA condition: SMA20 > SMA50 > SMA200
+    smaConds.daily = smaD && smaD.sma20 > smaD.sma50 && smaD.sma50 > smaD.sma200;
+    
+    // SMA conditions using cached values from database for current resolution
+    const { sma20:s20, sma50:s50, sma200:s200 } = smaBuf;
+    
+    // Daily SMA(close, 20) greater than Daily SMA(close, 50)
+    // Daily SMA(close, 50) greater than Daily SMA(close, 200)
+    const smaOK = s20 > s50 && s50 > s200;
+    
+    // Count how many timeframes show bullish SMA pattern
+    const bullishTimeframes = Object.values(smaConds).filter(Boolean).length;
+    
+    // Check if the shorter timeframes (1m and 5m) have valid data
+    const shortFramesValid = (sma1m !== undefined && sma5m !== undefined);
+    
+    // Check if at least one of the short timeframes is bullish (if we have valid data)
+    const shortTimeframesBullish = shortFramesValid ? 
+      (smaConds.minute1 || smaConds.minute5) : true; // If no data, consider as neutral (not negative)
+    
+    // All conditions must be true, including at least one short timeframe if data is available
+    const bullish =
+      rangeOK && closeGTopen && closeGTyest &&
+      volYestOK && wkBull && moBull && smaOK && 
+      shortTimeframesBullish; // Require at least one short timeframe to be bullish if data exists
+    
+    // Debug output for each condition
+    if (this.debug && isPriority) {
+      console.log(`\n--- ${symbol} Strategy Analysis ---`);
+      console.log(`Range comparisons:`);
+      rangeComparisons.forEach(comp => {
+        console.log(`  Day -${comp.day}: Today(${comp.today.toFixed(2)}) > Prev(${comp.prev.toFixed(2)}) = ${comp.result ? '✅' : '❌'}`);
+      });
+      console.log(`Close > Open: ${closeGTopen ? '✅' : '❌'}`);
+      console.log(`Close > Yesterday Close: ${closeGTyest ? '✅' : '❌'}`);
+      console.log(`Yesterday Vol > 10k: ${volYestOK ? '✅' : '❌'} (${daily.at(-2)[V].toFixed(0)})`);
+      console.log(`Weekly Bullish: ${wkBull ? '✅' : '❌'}`);
+      console.log(`Monthly Bullish: ${moBull ? '✅' : '❌'}`);
+      
+      // SMA debugging for all timeframes
+      console.log(`\nSMA Analysis by Timeframe:`);
+      if (sma1m) console.log(`  1m: SMA20(${sma1m.sma20?.toFixed(2)}) > SMA50(${sma1m.sma50?.toFixed(2)}) > SMA200(${sma1m.sma200?.toFixed(2)}): ${smaConds.minute1 ? '✅' : '❌'}`);
+      else console.log(`  1m: No data`);
+      
+      if (sma5m) console.log(`  5m: SMA20(${sma5m.sma20?.toFixed(2)}) > SMA50(${sma5m.sma50?.toFixed(2)}) > SMA200(${sma5m.sma200?.toFixed(2)}): ${smaConds.minute5 ? '✅' : '❌'}`);
+      else console.log(`  5m: No data`);
+      
+      if (sma60m) console.log(`  60m: SMA20(${sma60m.sma20?.toFixed(2)}) > SMA50(${sma60m.sma50?.toFixed(2)}) > SMA200(${sma60m.sma200?.toFixed(2)}): ${smaConds.minute60 ? '✅' : '❌'}`);
+      else console.log(`  60m: No data`);
+      
+      if (sma120m) console.log(`  120m: SMA20(${sma120m.sma20?.toFixed(2)}) > SMA50(${sma120m.sma50?.toFixed(2)}) > SMA200(${sma120m.sma200?.toFixed(2)}): ${smaConds.minute120 ? '✅' : '❌'}`);
+      else console.log(`  120m: No data`);
+      
+      if (smaD) console.log(`  D: SMA20(${smaD.sma20?.toFixed(2)}) > SMA50(${smaD.sma50?.toFixed(2)}) > SMA200(${smaD.sma200?.toFixed(2)}): ${smaConds.daily ? '✅' : '❌'}`);
+      else console.log(`  D: No data`);
+      
+      console.log(`Current Resolution (${this.smaRes}): SMA20(${s20?.toFixed(2)}) > SMA50(${s50?.toFixed(2)}) > SMA200(${s200?.toFixed(2)}): ${smaOK ? '✅' : '❌'}`);
+      console.log(`Bullish Timeframes: ${bullishTimeframes} of ${Object.keys(smaConds).length}`);
+      console.log(`Overall result: ${bullish ? '✅ BULLISH' : '❌ NOT BULLISH'}`);
+    }
+
+    this.#diff(symbol, {
+      symbol,
+      bullish,
+      rangeOK,
+      closeGTopen,
+      closeGTyest,
+      volYestOK,
+      wkBull,
+      moBull,
+      smaOK,
+      s20,
+      s50,
+      s200,
+      ma20_gt_ma200: s20 > s200,
+      isPriorityCheck: isPriority
+    });
   }
 
-  /**
-   * Get cached SMA value
-   * @param {string} symbol - Trading symbol
-   * @param {number} period - SMA period
-   * @returns {number|null} Cached SMA value or null if not found
-   */
-  getSMA(symbol, period) {
-    const cached = this.candleDB.getCachedSMA(symbol, this.smaRes, period);
-    return cached?.value || null;
+  /* ---------------- diff / emit --------------------------------- */
+  #diff(symbol, next) {
+    const prev = this.state.get(symbol);
+    this.state.set(symbol, next);
+
+    if (this.debug) {
+      console.log(
+        `${symbol}${next.isPriorityCheck ? " [PRIORITY]" : ""}: ${
+          next.bullish ? "✅" : "❌"
+        }`
+      );
+    }
+
+    /* --------- new bullish ------------------------------------- */
+    if (next.bullish && !prev?.bullish) {
+      const daily = this.dailyMap.get(symbol);
+      const latest = daily.at(-1);
+      const prevC  = daily.at(-2) || latest;
+      const price  = latest[C];
+      const diff   = price - prevC[C];
+      const pct    = ((diff / prevC[C]) * 100).toFixed(2);
+      const [exch, codeRaw] = symbol.split(":");
+      const stock = codeRaw ? codeRaw.split("-")[0] : symbol;
+
+      const payload = {
+        trade: {
+          key: this.#makeKey(symbol),
+          resolution: this.smaRes,
+          symbol: stock,
+          exchange: exch || "NSE",
+          type: "BUY",
+          price: price.toFixed(2),
+          change: diff.toFixed(2),
+          changePercentage: `${pct}%`,
+          entryPrice: price.toFixed(2),
+          stopLoss: (price * 0.95).toFixed(2),
+          target: (price * 1.10).toFixed(2),
+          liveReturns: "0.00%",
+          estimatedGains: "10.00%",
+          entryTime: moment.unix(latest[T]).format("HH:mm"),
+          entryDate: moment.unix(latest[T]).format("DD-MM-YYYY"),
+          isProfit: diff >= 0
+        }
+      };
+
+      this.emit("bullish", payload);
+      this.io?.emit("bullishSignal", payload);
+      this.io?.emit("signalRefresh", { ts: Date.now() });
+    }
+
+    /* --------- clear ------------------------------------------- */
+    if (!next.bullish && prev?.bullish) {
+      const payload = { key: this.#makeKey(symbol) };
+      this.emit("clear", payload);
+      this.io?.emit("clear", payload);
+      this.io?.emit("signalRefresh", { ts: Date.now() });
+    }
+  }
+
+  /* ------------- analyzeCurrentData (UI refresh) ---------------- */
+  async analyzeCurrentData() {
+    const symbols = [...this.dailyMap.keys()];
+    if (!symbols.length) return [];
+
+    for (const s of symbols) {
+      this.smaMap.delete(s);
+      await this.#ensureSMA(s);
+    }
+
+    const results = [];
+    for (const s of symbols) {
+      const close = this.dailyMap.get(s).at(-1)[C];
+      await this.tick(s, close);
+      results.push(this.state.get(s));
+    }
+    return results;
   }
 }
 

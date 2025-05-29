@@ -1,36 +1,32 @@
 /* ------------------------------------------------------------------ */
-/*  tradingService.js – Fyers API v3 (Unix timestamps, multi-timeframe) */
+/*  tradingService.js – Fyers API v3  |  SQLite cache + retry logic   */
 /* ------------------------------------------------------------------ */
 const { fyersModel } = require("fyers-api-v3");
 const authManager    = require("./auth2.0");
 const moment         = require("moment");
 const path           = require("path");
 const dotenv         = require("dotenv");
-const CandleDB       = require("./candleDB");
+const candleDB       = require("./candleDB");          // ← SQLite wrapper
 
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
-/* Helper functions */
+/* ----------------------------- helpers --------------------------- */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-/* ------------------------------------------------------------------ */
-/* Intraday look-back caps (calendar days)                            */
-/* ------------------------------------------------------------------ */
 function maxDaysFor(resMin) {
-  if (resMin <= 15)  return 30;    // 1–15 min
-  if (resMin <= 60)  return 180;   // 30 & 60 min
-  if (resMin <= 120) return 180;   // 120 min
-  return 365;                      // daily+
+  if (resMin <= 15)  return 30;
+  if (resMin <= 60)  return 180;
+  if (resMin <= 120) return 180;
+  return 365;
 }
 
 class RateLimiter {
   constructor(maxPerMin = 8) {
     this.max    = maxPerMin;
     this.tokens = maxPerMin;
+    this.rate   = maxPerMin / 60;      // tokens per second
     this.last   = Date.now();
-    this.rate   = maxPerMin / 60; // tokens per sec
   }
-  
   async wait() {
     this._refill();
     if (this.tokens < 1) {
@@ -41,7 +37,6 @@ class RateLimiter {
     }
     this.tokens -= 1;
   }
-  
   _refill() {
     const add = ((Date.now() - this.last) / 1000) * this.rate;
     if (add > 0) {
@@ -51,141 +46,96 @@ class RateLimiter {
   }
 }
 
+/* ------------------------------------------------------------------ */
 class TradingService {
   constructor() {
     this.fyers     = null;
     this.limiter   = new RateLimiter(8);
-    this.cache     = new Map();          // key → {ts,data} (in-memory cache)
-    this.cacheTTL  = 5 * 60_000;
+    this.cache     = new Map();          // key → { ts, data }
+    this.cacheTTL  = 5 * 60_000;         // 5 minutes
     this.lastCall  = 0;
-    this.candleDB  = new CandleDB(path.join(__dirname, '../data/candles.db'));
   }
 
-  /* ---------- bootstrap ------------------------------------------ */
+  /* ---------------- bootstrap (unchanged) ----------------------- */
   async initialize() {
-    if (!this.fyers) {
-      await authManager.initialize();
-      let token = await authManager.getAccessToken();
-      if (!token) token = await authManager.authenticate();
-      if (!token) throw new Error('Failed to get access token');
+    if (this.fyers) return this;
 
-      console.log("🔑 using token:", token.slice(0, 30) + "…");
-      this.fyers = new fyersModel({
-        path: path.resolve(__dirname, '../logs'),
-        enableLogging: true
-      });
-      this.fyers.setAppId(process.env.FYERS_APP_ID);
-      this.fyers.setRedirectUrl(process.env.FYERS_REDIRECT_URI);
-      this.fyers.setAccessToken(token);
+    await authManager.initialize();
+    let token = await authManager.getAccessToken();
+    if (!token) token = await authManager.authenticate();
+    if (!token) throw new Error("Failed to get access token");
 
-      try {
-        const profile = await this.fyers.get_profile();
-        if (!profile || profile.s !== 'ok') throw new Error('Profile validation failed');
-        console.log('✅ Fyers client initialized successfully');
-      } catch (err) {
-        console.error('❌ Fyers client validation failed:', err);
-        throw err;
-      }
-    }
+    console.log("🔑 using token:", token.slice(0, 30), "…");
+
+    this.fyers = new fyersModel({ path: path.resolve(__dirname, "../logs"), enableLogging: true });
+    this.fyers.setAppId(process.env.FYERS_APP_ID);
+    this.fyers.setRedirectUrl(process.env.FYERS_REDIRECT_URI);
+    this.fyers.setAccessToken(token);
+
+    const profile = await this.fyers.get_profile();
+    if (!profile || profile.s !== "ok") throw new Error("Profile validation failed");
+    console.log("✅ Fyers client initialised");
     return this;
   }
 
-  /* ---------- internal fetch with retries ------------------------ */
+  /* ---------------- low-level fetch with retries ---------------- */
   async _fetch(params, sym, resStr, want, retry = 0) {
     const resMin  = /^\d+$/.test(resStr) ? Number(resStr) : null;
     const isIntra = !!resMin;
     const limitD  = isIntra ? maxDaysFor(resMin) : 365;
 
-    if (retry > 3) {
-      console.warn(`⚠️ max retries ${sym}@${resStr}`);
+    if (retry > 3)
       return { success: false, candles: [] };
-    }
 
     try {
-      // Handle date_format conversion for API params
-      const originalParams = { ...params };
-      
-      // Convert YYYY-MM-DD format to Unix timestamp if needed for API request
+      /* convert YYYY-MM-DD to Unix ts if API needs it ------------ */
+      const original = { ...params };
       if (params.date_format === "1") {
-        // Keep the original params for recursive calls
-        if (params.range_from && !isNaN(Number(params.range_from))) {
-          // Already in timestamp format, no conversion needed
-        } else if (params.range_from) {
-          const fromMoment = moment(params.range_from, 'YYYY-MM-DD');
-          if (fromMoment.isValid()) {
-            params.range_from = String(fromMoment.unix());
+        for (const k of ["range_from", "range_to"]) {
+          if (params[k] && isNaN(Number(params[k]))) {
+            const m = moment(params[k], "YYYY-MM-DD");
+            if (m.isValid()) params[k] = String(m.unix());
           }
         }
-        
-        if (params.range_to && !isNaN(Number(params.range_to))) {
-          // Already in timestamp format, no conversion needed
-        } else if (params.range_to) {
-          const toMoment = moment(params.range_to, 'YYYY-MM-DD');
-          if (toMoment.isValid()) {
-            params.range_to = String(toMoment.unix());
-          }
-        }
-        
-        // Change date_format to 0 for API request
         params.date_format = "0";
       }
-      
+
       const resp = await this.fyers.getHistory(params);
       if (!resp || resp.s !== "ok" || !Array.isArray(resp.candles))
         throw new Error(resp?.s || "API error");
 
-      const candles = resp.candles;
+      const candles = resp.candles;                 // Fyers returns ms
       if (candles.length >= want || !isIntra)
         return { success: true, candles };
 
-      /* expand but stay inside maxDaysFor window ------------------ */
+      /* ------------ need more intraday data --------------------- */
       const earliest = moment().subtract(limitD, "days").unix();
-      let span, nextFrom;
-      
-      // Calculate span and nextFrom based on date format
-      if (originalParams.date_format === "1") {
-        // Use the original date strings for calculating the next range
-        const fromMoment = moment(originalParams.range_from, 'YYYY-MM-DD');
-        const toMoment = moment(originalParams.range_to, 'YYYY-MM-DD');
-        
-        if (!fromMoment.isValid() || !toMoment.isValid()) {
-          throw new Error(`Invalid date format: ${originalParams.range_from} → ${originalParams.range_to}`);
-        }
-        
-        span = toMoment.diff(fromMoment, 'days');
-        const newFromMoment = fromMoment.subtract(span * (retry + 1), 'days');
-        
-        if (newFromMoment.unix() <= earliest) {
-          return { success: true, candles };
-        }
-        
-        // Restore original format for recursive call
-        originalParams.range_from = newFromMoment.format('YYYY-MM-DD');
+
+      if (original.date_format === "1") {
+        const f = moment(original.range_from, "YYYY-MM-DD");
+        const t = moment(original.range_to,   "YYYY-MM-DD");
+        const span = t.diff(f, "days");
+        const newFrom = f.subtract(span * (retry + 1), "days");
+        if (newFrom.unix() <= earliest) return { success: true, candles };
+
+        original.range_from = newFrom.format("YYYY-MM-DD");
         await sleep(1000 * 2 ** retry);
-        return this._fetch(originalParams, sym, resStr, want, retry + 1);
-      } else {
-        // Original Unix timestamp format
-        span = Number(params.range_to) - Number(params.range_from);
-        nextFrom = Number(params.range_from) - span * (retry + 1);
-        
-        if (nextFrom <= earliest) {
-          return { success: true, candles };
-        }
-        
-        params.range_from = String(nextFrom);
-        await sleep(1000 * 2 ** retry);
+        const more = await this._fetch(original, sym, resStr, want, retry + 1);
+        return { success: true, candles: [...candles, ...more.candles].sort((a, b) => a[0] - b[0]) };
       }
-      
-      const moreData = await this._fetch(params, sym, resStr, want, retry + 1);
-      
-      if (moreData.success && moreData.candles.length > 0) {
-        // Combine the candles, removing duplicates
-        const existingTimestamps = new Set(candles.map(c => c[0]));
-        const newCandles = moreData.candles.filter(c => !existingTimestamps.has(c[0]));
-        return { success: true, candles: [...candles, ...newCandles].sort((a, b) => a[0] - b[0]) };
-      }
-      
-      return { success: true, candles };
+
+      const span = Number(params.range_to) - Number(params.range_from);
+      const nextFrom = Number(params.range_from) - span * (retry + 1);
+      if (nextFrom <= earliest) return { success: true, candles };
+
+      params.range_from = String(nextFrom);
+      await sleep(1000 * 2 ** retry);
+      const more = await this._fetch(params, sym, resStr, want, retry + 1);
+
+      const seen = new Set(candles.map(c => c[0]));
+      const merged = [...candles, ...more.candles.filter(c => !seen.has(c[0]))]
+                     .sort((a, b) => a[0] - b[0]);
+      return { success: true, candles: merged };
     } catch (err) {
       console.error(`❌ fetch ${sym}@${resStr}: ${err.message}`);
       await sleep(1000 * 2 ** retry);
@@ -193,126 +143,101 @@ class TradingService {
     }
   }
 
-  /* ---------- public: getHistoricalData -------------------------- */
+  /* ---------------- public: getHistoricalData ------------------- */
   async getHistoricalData(symbol, resolution = "D", lookback = 365) {
-    /* 1. normalise resolution ----------------------------------- */
+    /* 1️⃣ normalise resolution ---------------------------------- */
     let res = String(resolution).toUpperCase().trim();
-
-    if (res === "240") res = "120";                // ← 4-h fallback
-    if (/^\d+M$/i.test(res)) res = res.slice(0, -1);           // 15M→15
-    if (/^\d+H$/i.test(res)) res = String(parseInt(res) * 60); // 2H→120
+    if (res === "240") res = "120";
+    if (/^\d+M$/i.test(res)) res = res.slice(0, -1);
+    if (/^\d+H$/i.test(res)) res = String(parseInt(res) * 60);
     if (res === "1D") res = "D";
     if (res !== "D" && res !== "W" && res !== "M" && !/^\d+$/.test(res))
       throw new Error(`Bad resolution: ${resolution}`);
-    
-    // Handle weekly and monthly by rolling up daily data
+
+    /* 2️⃣ weekly / monthly roll-up ------------------------------ */
     if (res === "W" || res === "M") {
-      const days  = res === "W" ? lookback * 7 : lookback * 31;
+      const days = res === "W" ? lookback * 7 : lookback * 31;
       const daily = await this.getHistoricalData(symbol, "D", days);
       return { success: daily.success, candles: this._rollup(daily.candles, res) };
     }
 
-    /* 2. rate-limit -------------------------------------------- */
+    /* 3️⃣ obey rate-limit -------------------------------------- */
     await this.limiter.wait();
     const lag = Date.now() - this.lastCall;
     if (lag < 500) await sleep(500 - lag);
     this.lastCall = Date.now();
 
-    /* 3. figure look-back window -------------------------------- */
-    const WANT    = 200;
-    const resMin  = res === "D" ? 1440 : Number(res);
-    const dayMin  = 6.5 * 60;
-    let backDays  = Math.ceil((WANT * resMin) / dayMin) * 1.3;
-    backDays      = Math.min(backDays, maxDaysFor(resMin));
-
+    /* 4️⃣ compute look-back window ------------------------------ */
+    const WANT   = 200;
+    const resMin = res === "D" ? 1440 : Number(res);
+    const backDays = Math.min(
+      Math.ceil((WANT * resMin) / (6.5 * 60)) * 1.3,
+      maxDaysFor(resMin)
+    );
     const end   = moment().unix();
     const start = moment().subtract(backDays, "days").unix();
 
-    /* 4. in-memory cache first ----------------------------------- */
+    /* 5️⃣ SQLite first ----------------------------------------- */
+    if (candleDB.countCandles(symbol, res, start, end) >= WANT) {
+      const candles = candleDB.getCandles(symbol, res, start, end);
+      const ok = { success: true, candles };
+      this.cache.set(`${symbol}_${res}_${start}_${end}`, { ts: Date.now(), data: ok });
+      return ok;
+    }
+
+    /* 6️⃣ RAM cache -------------------------------------------- */
     const key = `${symbol}_${res}_${start}_${end}`;
     const hit = this.cache.get(key);
     if (hit && Date.now() - hit.ts < this.cacheTTL) return hit.data;
 
-    /* 5. Check SQLite cache for daily data ---------------------- */
-    if (res === "D" && !this.candleDB.needsUpdate(symbol)) {
-      const candles = this.candleDB.getDailyCandles(symbol, start, end);
-      if (candles.length > 0) {
-        const result = { success: true, candles };
-        this.cache.set(key, { ts: Date.now(), data: result });
-        return result;
-      }
-    }
-
-    /* 6. build params & fetch all data if needed ----------------- */
+    /* 7️⃣ call API --------------------------------------------- */
     const p = {
       symbol,
       resolution : res,
-      date_format: "1",     // Use YYYY-MM-DD format as per memory note
-      range_from : moment.unix(start).format('YYYY-MM-DD'),
-      range_to   : moment.unix(end).format('YYYY-MM-DD'),
-      cont_flag  : "1",
+      date_format: "1",
+      range_from : moment.unix(start).format("YYYY-MM-DD"),
+      range_to   : moment.unix(end).format("YYYY-MM-DD"),
+      cont_flag  : "1"
     };
+    console.log(`📈 ${symbol}@${res} ${p.range_from} → ${p.range_to}`);
 
-    console.log(`📈 ${symbol}@${res} ${moment.unix(start).format("YYYY-MM-DD")} → ${moment.unix(end).format("YYYY-MM-DD")}`);
-    const result = await this._fetch(p, symbol, res, WANT);
-    
-    // Cache in both memory and SQLite
-    this.cache.set(key, { ts: Date.now(), data: result });
-    if (res === "D") {
-      this.candleDB.storeDailyCandles(symbol, result.candles);
+    let result = await this._fetch(p, symbol, res, WANT);
+    if (!result || typeof result !== "object")
+      result = { success: false, candles: [] };
+    if (!("success" in result))
+      result = { success: true, candles: result.candles ?? [] };
+
+    /* 8️⃣ persist & memoise ------------------------------------ */
+    if (result.success && Array.isArray(result.candles) && result.candles.length) {
+      candleDB.storeCandles(symbol, res, result.candles);
     }
-    
+    this.cache.set(key, { ts: Date.now(), data: result });
     return result;
   }
-  
-  /* ---------- Helper: roll up daily data to weekly/monthly ------- */
-  _rollup(daily, mode) {
-    if (!daily || daily.length === 0) return [];
-    
-    const map = new Map();
-    daily.forEach(([ts, o, h, l, c, v]) => {
-      const d   = moment.unix(ts);
-      const key = mode === "W"
-        ? `${d.isoWeek()}_${d.year()}`
-        : `${d.year()}_${d.format("MM")}`;
 
-      if (!map.has(key)) map.set(key, [ts, o, h, l, c, v]);
+  /* ---------------- roll-up helper ------------------------------ */
+  _rollup(daily, mode) {
+    if (!daily?.length) return [];
+    const m = new Map();
+    daily.forEach(([ts, o, h, l, c, v]) => {
+      const d = moment.unix(ts);
+      const key = mode === "W" ? `${d.isoWeek()}_${d.year()}` : `${d.year()}_${d.format("MM")}`;
+      if (!m.has(key)) m.set(key, [ts, o, h, l, c, v]);
       else {
-        const m = map.get(key);
-        m[2] = Math.max(m[2], h);
-        m[3] = Math.min(m[3], l);
-        m[4] = c;
-        m[5] += v;
+        const r = m.get(key);
+        r[2] = Math.max(r[2], h);
+        r[3] = Math.min(r[3], l);
+        r[4] = c;
+        r[5] += v;
       }
     });
-    return Array.from(map.values()).sort((a, b) => a[0] - b[0]);
-  }
-  
-  /* ---------- sockets & profile --------------------------------- */
-  async getProfile() { 
-    await this.initialize();
-    return this.fyers.get_profile(); 
-  }
-  
-  async connectOrderSocket(tok) {
-    if (!tok) throw new Error("token required");
-    const orderSocket = require("./orderSocket");
-    return orderSocket.connect(tok);
-  }
-  
-  async connectDataSocket(tok) {
-    if (!tok) throw new Error("token required");
-    const dataSocket = require("./dataSocket");
-    return dataSocket.connect(tok);
+    return [...m.values()].sort((a, b) => a[0] - b[0]);
   }
 
-  /**
-   * Close database connection
-   */
-  close() {
-    this.candleDB.close();
-  }
+  /* ---------------- misc pass-throughs -------------------------- */
+  async getProfile()            { await this.initialize(); return this.fyers.get_profile(); }
+  async connectOrderSocket(t)   { if (!t) throw new Error("token required"); return require("./orderSocket").connect(t); }
+  async connectDataSocket(t)    { if (!t) throw new Error("token required"); return require("./dataSocket").connect(t); }
 }
 
-// Export a singleton instance instead of the class
 module.exports = new TradingService();
